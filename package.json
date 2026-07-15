@@ -1,0 +1,25 @@
+{
+  "name": "mcp-video-agent",
+  "version": "1.0.0",
+  "description": "MCP Server: 基于 Playwright + Edge 驱动的视频操控 Agent",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "mcp-video-agent": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc && node dist/index.js",
+    "install-browsers": "npx playwright install msedge"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "playwright": "^1.54.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.0"
+  }
+}
