@@ -192,16 +192,25 @@ const server = new McpServer({
 // ── 工具 1: video_navigate ──────────────────────────────
 server.tool(
   "video_navigate",
-  "打开视频网页。自动等待页面加载完成。",
+  "打开视频网页。自动等待页面及播放器加载完成。",
   {
     url: z.string().describe("视频网页 URL"),
-    waitUntil: z.enum(["load", "domcontentloaded", "networkidle"]).default("domcontentloaded")
-      .describe("等待策略：domcontentloaded(快)/load(完整)/networkidle(全部资源)"),
+    waitUntil: z.enum(["load", "domcontentloaded", "networkidle"]).default("networkidle")
+      .describe("等待策略：networkidle(默认/最稳)/load/domcontentloaded(快)"),
   },
   async ({ url, waitUntil }) => {
     try {
       const p = await getPage();
       await p.goto(url, { waitUntil, timeout: 30000 });
+
+      // 等待播放器初始化：轮询直到 video 元素 readyState >= 1
+      await p.waitForFunction(() => {
+        const v = document.querySelector("video");
+        return v && v.readyState >= 1;
+      }, { timeout: 8000 }).catch(() => {
+        // 超时不报错，部分网站用自定义播放器没有标准 video 元素
+      });
+
       const state: Record<string, unknown> = await p.evaluate(injectStateSnapshot()) as any;
       return {
         content: [{ type: "text" as const, text: JSON.stringify({ success: true, ...state }, null, 2) }],
@@ -220,17 +229,15 @@ server.tool(
   async () => {
     try {
       const p = await getPage();
-      const played = await p.evaluate(() => {
+      const result = await p.evaluate(() => {
         const videos = document.querySelectorAll("video");
+        let playing = 0;
         for (const v of videos) {
-          if (v.paused || v.ended) { v.play().catch(() => {}); return { method: "video.play()", count: videos.length }; }
+          if (!v.paused && !v.ended) playing++;
+          else if (v.paused || v.ended) { v.play().catch(() => {}); playing++; }
         }
-        return null;
-      });
-      if (played) {
-        return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, ...played }) }] };
-      }
-      const clicked = await p.evaluate(() => {
+        if (playing > 0) return { method: "video.play()", videoCount: videos.length, playing };
+        // fallback: 点击播放按钮
         const sels = ['[aria-label="播放"]','[aria-label="Play"]','.play-button','.play-btn','[class*="play"]','.vjs-big-play-button','.ytp-play-button','.bpx-player-ctrl-play','button[title*="播放"]','button[title*="Play"]','[data-action="play"]'];
         for (const sel of sels) {
           const el = document.querySelector(sel) as HTMLElement;
@@ -238,8 +245,8 @@ server.tool(
         }
         return null;
       });
-      if (clicked) {
-        return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, ...clicked }) }] };
+      if (result) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, ...result }) }] };
       }
       return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: "no play method found" }) }], isError: true };
     } catch (error: any) {
