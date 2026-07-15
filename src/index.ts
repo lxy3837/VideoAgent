@@ -47,7 +47,6 @@ async function getPage(): Promise<Page> {
   });
   context = await browser.newContext({
     viewport: { width: 1280, height: 720 },
-    permissions: ["autoplay"],
   });
   page = await context.newPage();
   return page;
