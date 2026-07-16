@@ -195,11 +195,28 @@ server.tool(
   "打开视频网页。自动等待页面及播放器加载完成。",
   {
     url: z.string().describe("视频网页 URL"),
+    cookies: z.string().optional().describe("可选的 Cookie 字符串（格式: 'key1=val1; key2=val2'），用于登录态"),
     waitUntil: z.enum(["load", "domcontentloaded", "networkidle"]).default("networkidle")
       .describe("等待策略：networkidle(默认/最稳)/load/domcontentloaded(快)"),
   },
-  async ({ url, waitUntil }) => {
+  async ({ url, cookies, waitUntil }) => {
     try {
+      // 如果传了 cookie，注入到浏览器上下文
+      if (cookies && context) {
+        const domain = new URL(url).hostname;
+        const cookieList = cookies.split(";").map(c => c.trim()).filter(c => c && c.includes("=")).map(c => {
+          const [name, ...rest] = c.split("=");
+          return {
+            name: name.trim(),
+            value: rest.join("=").trim(),
+            domain: domain.startsWith("www.") ? domain : `.${domain}`,
+            path: "/",
+          };
+        });
+        if (cookieList.length > 0) {
+          await context.addCookies(cookieList);
+        }
+      }
       const p = await getPage();
       await p.goto(url, { waitUntil, timeout: 30000 });
 
@@ -317,15 +334,17 @@ server.tool(
   `截图当前画面，返回 base64 图片 + 截图时的精确视频时间戳。
 Agent 可据此验证截图帧是否在预期位置，drift 过大则重试。`,
   {
+    name: z.string().optional().describe("自定义文件名（不含扩展名），Agent 根据语义命名，如 '10s_ROS架构对比'"),
     selector: z.string().optional().describe("CSS 选择器，只截取该元素区域"),
     fullPage: z.boolean().default(false),
   },
-  async ({ selector, fullPage }) => {
+  async ({ name, selector, fullPage }) => {
     try {
       const p = await getPage();
       ensureScreenshotDir();
       const ts = Date.now();
-      const filename = `frame_${ts}.png`;
+      const safe = name ? name.replace(/[<>:"/\\|?*]/g, '_').slice(0, 80) : null;
+      const filename = safe ? `${safe}.png` : `frame_${ts}.png`;
       const filepath = path.join(SCREENSHOT_DIR, filename);
 
       if (selector) {
@@ -372,10 +391,11 @@ server.tool(
 返回 base64 图片 + 元数据 {targetTime, actualTime, drift, readyState}，drift<0.5 为可靠。`,
   {
     seconds: z.number().min(0).describe("目标截图时间（秒）"),
+    name: z.string().optional().describe("自定义文件名（不含扩展名），Agent 根据语义命名"),
     tolerance: z.number().default(0.5).describe("允许的最大 drift（秒），超出则标记 unreliable"),
     maxWaitMs: z.number().default(15000).describe("最大等待时间（ms），含缓冲时间"),
   },
-  async ({ seconds, tolerance, maxWaitMs }) => {
+  async ({ seconds, name, tolerance, maxWaitMs }) => {
     try {
       const p = await getPage();
 
@@ -385,7 +405,8 @@ server.tool(
       // Step 2: 截图
       ensureScreenshotDir();
       const ts = Date.now();
-      const filename = `capture_${seconds.toFixed(1)}s_${ts}.png`;
+      const safe = name ? name.replace(/[<>:"/\\|?*]/g, '_').slice(0, 80) : null;
+      const filename = safe ? `${safe}.png` : `capture_${seconds.toFixed(1)}s_${ts}.png`;
       const filepath = path.join(SCREENSHOT_DIR, filename);
       await p.screenshot({ path: filepath, type: "png" });
 
@@ -429,7 +450,134 @@ server.tool(
   }
 );
 
-// ── 工具 8: video_capture_sequence — 批量截图（滑动窗口采样）─
+// ── 工具 8: video_capture_batch — 批量截图 + 自动回位（Agent 专用）─
+server.tool(
+  "video_capture_batch",
+  `【Agent 专用批量工具】一次 MCP 调用完成多个截图 + 完成后自动回到原播放位置。
+
+设计目的：
+- Agent 一次决策可能产生多个截图需求，逐个调用 video_capture_at 有 N 次 MCP 通信开销
+- 本工具一次提交所有截图计划，内部批量执行，省 token、省延迟
+- 截图完成后自动 seek 回原播放位置，Agent 不丢进度、不会重复截图
+
+使用方式: Agent 调用 agent_decide_screenshots 得到 [{time, label}] → 直接传入本工具`,
+  {
+    shots: z.array(z.object({
+      time: z.number().min(0).describe("目标截图时间（秒）"),
+      name: z.string().describe("语义标签，用于文件命名"),
+    })).min(1).max(12).describe("截图计划列表，按时间排序后批量执行。最多 12 个截图点"),
+    tolerance: z.number().default(0.5).describe("允许的最大 drift（秒）"),
+    maxWaitMs: z.number().default(10000).describe("每帧最大等待时间（ms）"),
+  },
+  async ({ shots, tolerance, maxWaitMs }) => {
+    try {
+      const p = await getPage();
+
+      // ▸ 保存当前播放状态
+      const savedState = await p.evaluate(() => {
+        const v = document.querySelector("video");
+        return v ? { currentTime: v.currentTime, paused: v.paused } : null;
+      });
+
+      if (!savedState) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "no video found" }) }], isError: true };
+      }
+
+      const results: any[] = [];
+
+      // ▸ 按时间排序（避免视频跳来跳去造成解码压力）
+      const sorted = [...shots].sort((a, b) => a.time - b.time);
+      for (const shot of sorted) {
+        try {
+          // 精准 seek + 等待帧就绪
+          const seekResult = await p.evaluate(injectSeekWaitScript(shot.time, 0.3, maxWaitMs * 0.7));
+
+          // 截图
+          ensureScreenshotDir();
+          const safe = shot.name.replace(/[<>:"/\\|?*]/g, "_").slice(0, 80);
+          const filename = `${safe}.png`;
+          const filepath = path.join(SCREENSHOT_DIR, filename);
+          await p.screenshot({ path: filepath, type: "png" });
+
+          const actualTime = await p.evaluate(() => {
+            const v = document.querySelector("video");
+            return v ? v.currentTime : -1;
+          });
+
+          const buffer = readFileSync(filepath);
+          const drift = Math.abs(actualTime - shot.time);
+          const reliable = drift <= tolerance && (seekResult as any).ok !== false;
+
+          results.push({
+            targetTime: shot.time,
+            name: shot.name,
+            actualTime,
+            drift,
+            reliable,
+            filepath,
+            sizeBytes: buffer.length,
+            base64: buffer.toString("base64"),
+          });
+        } catch (e: any) {
+          results.push({ targetTime: shot.time, name: shot.name, error: e.message });
+        }
+      }
+
+      // ▸ 回到原播放位置（自动回位，Agent 不丢进度）
+      await p.evaluate(injectSeekWaitScript(savedState.currentTime, 0.3, 8000));
+      if (!savedState.paused) {
+        await p.evaluate(() => {
+          const v = document.querySelector("video");
+          if (v && v.paused) (v as HTMLVideoElement).play().catch(() => {});
+        });
+      }
+
+      // ▸ 验证回到原位
+      const finalTime = await p.evaluate(() => {
+        const v = document.querySelector("video");
+        return v ? v.currentTime : -1;
+      });
+
+      const captured = results.filter(r => !r.error);
+      const failed = results.filter(r => r.error);
+
+      return {
+        content: [
+          ...captured.map(r => ({
+            type: "image" as const,
+            data: r.base64,
+            mimeType: "image/png" as const,
+          })),
+          {
+            type: "text" as const,
+            text: JSON.stringify({
+              ok: true,
+              totalShots: shots.length,
+              captured: captured.length,
+              failed: failed.length,
+              savedPosition: savedState.currentTime,
+              returnedTo: finalTime,
+              returnDrift: Math.abs(finalTime - savedState.currentTime),
+              resumePlay: !savedState.paused,
+              results: results.map(r => ({
+                targetTime: r.targetTime,
+                name: r.name,
+                drift: r.drift ?? null,
+                reliable: r.reliable ?? false,
+                filepath: r.filepath ?? null,
+                error: r.error ?? null,
+              })),
+            }, null, 2),
+          },
+        ],
+      };
+    } catch (error: any) {
+      return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: error.message }) }], isError: true };
+    }
+  }
+);
+
+// ── 工具 9: video_capture_sequence — 等间隔批量截图（滑动窗口采样）─
 server.tool(
   "video_capture_sequence",
   `【批量工具】在时间区间内等间隔截取多帧。类似 live_caption 滑动窗口思路：

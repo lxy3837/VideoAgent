@@ -29,3 +29,6 @@ captions_*.txt
 
 # Whisper models
 models/
+
+# Test outputs
+stderr*.log
