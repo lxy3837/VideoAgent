@@ -14,29 +14,49 @@ import requests
 
 # ── 配置 ────────────────────────────────────────────────
 
-DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_MODEL = "deepseek-v4-flash"   # 最新模型，快且便宜
 MAX_RETRIES = 3
 REQUEST_TIMEOUT = 60  # 秒
 
 
-# ── 截图决策提示词 ──────────────────────────────────────
+# ── 视频分析提示词（v2：带状态 + 动作控制）─────────────────
 
-ANALYZE_SCREENSHOTS_SYSTEM = """你是一个视频内容分析专家。用户会给你一段视频字幕文本（带时间戳），你需要：
-1. 阅读字幕内容，理解视频讲述的核心内容
-2. 找出最值得截图的关键时刻（如：架构图、公式、代码演示、关键概念、数据图表、对比表格等）
-3. 为每个截图时间点生成一个简短的中文描述名称（10字以内）
+ANALYZE_SCREENSHOTS_SYSTEM = """你是一个视频分析助手。每轮你会收到一段字幕文本和当前视频状态。
 
-输出格式必须是严格的 JSON 数组，不要包含任何其他文字：
-[{"time": 秒数, "name": "简短名称"}, ...]
+**视频状态字段**：
+- video_time: 视频当前播放到的秒数
+- duration: 视频总时长
+- paused: 是否已暂停
 
-规则：
-- 至少输出 3 个时间点，最多 10 个
-- time 使用字幕中 [T=XXs] 的时间戳
-- name 要能一眼看出截图内容是什么
-- 优先选择有视觉内容输出的时刻（图示、公式、代码、对比等）
-- 纯口语过渡、寒暄、重复内容不截图
-- 不要让连续两个截图的间隔小于 30 秒"""
+**你每轮有 0~3 个截图额度**。你可以执行以下动作：
+
+| 动作 | 说明 |
+|------|------|
+| seek(time) | 跳转到指定秒数 |
+| pause() | 暂停视频（截图前必须暂停） |
+| screenshot(name) | 截图，name 为简短中文描述（≤10字） |
+| play() | 继续播放 |
+
+**输出格式**（严格的 JSON，不要包含其他文字）：
+{
+  "summary": "这一段主要讲了...（≤50字）",
+  "actions": [
+    {"type": "seek", "time": 250.0},
+    {"type": "pause"},
+    {"type": "screenshot", "name": "架构图"},
+    {"type": "play"}
+  ]
+}
+
+**规则**：
+- 每轮最多 3 个 screenshot
+- 截图前必须先 seek + pause
+- 截图后建议 play 恢复播放
+- 没有值得截图的内容 → actions 为空数组 []
+- 纯寒暄/闲聊/过渡话/重复 → 不截图
+- 优先截：图表、公式、代码、架构、对比、关键概念
+- 连续两次 screenshot 间隔 ≥ 30 秒"""
 
 
 # ═══════════════════════════════════════════════════════════
@@ -128,15 +148,25 @@ class DeepSeekClient:
     def analyze_screenshots(
         self,
         subtitle_text: str,
+        video_state: dict | None = None,
         custom_instruction: str | None = None,
-    ) -> list[dict]:
+    ) -> dict:
         """
-        分析字幕文本，返回截图决策。
+        分析字幕 + 视频状态，返回截图动作决策。
 
         subtitle_text: 字幕文本（含 [T=XXs] 时间戳）
-        custom_instruction: 额外指令（如"多截一些代码相关的图"）
+        video_state: {"video_time": 245.3, "duration": 1200, "paused": False}
+        custom_instruction: 额外指令
 
-        返回: [{"time": 120.5, "name": "架构图"}, ...]
+        返回: {
+            "summary": "分析摘要",
+            "actions": [
+                {"type": "seek", "time": 250.0},
+                {"type": "pause"},
+                {"type": "screenshot", "name": "架构图"},
+                {"type": "play"},
+            ]
+        }
         """
         if not self._api_key:
             raise RuntimeError(
@@ -144,9 +174,17 @@ class DeepSeekClient:
             )
 
         if not subtitle_text.strip():
-            return []
+            return {"summary": "", "actions": []}
 
-        user_prompt = f"请分析以下视频字幕，找出值得截图的关键时刻：\n\n{subtitle_text}"
+        # 构建状态描述
+        state_desc = ""
+        if video_state:
+            t = video_state.get("video_time", 0)
+            d = video_state.get("duration", 0)
+            p = "已暂停" if video_state.get("paused") else "播放中"
+            state_desc = f"\n**当前视频状态**：{p}, 位置 {t:.0f}s / {d:.0f}s\n"
+
+        user_prompt = f"请分析以下视频字幕，决定是否截图及如何操作：\n{state_desc}\n{subtitle_text}"
 
         if custom_instruction:
             user_prompt += f"\n\n额外要求：{custom_instruction}"
@@ -160,74 +198,208 @@ class DeepSeekClient:
 
         # 解析 JSON
         try:
-            # 先尝试直接解析
-            shots = json.loads(response.strip())
+            parsed = json.loads(response.strip())
         except json.JSONDecodeError:
-            # 可能有 markdown 包裹 ```json ... ```
             import re
             match = re.search(r'```(?:json)?\s*([\s\S]*?)```', response)
             if match:
                 try:
-                    shots = json.loads(match.group(1).strip())
+                    parsed = json.loads(match.group(1).strip())
                 except json.JSONDecodeError:
-                    # 尝试修复截断的 JSON
-                    shots = self._repair_truncated_json(response)
+                    parsed = self._repair_action_json(response)
             else:
-                shots = self._repair_truncated_json(response)
+                parsed = self._repair_action_json(response)
 
-        # 验证格式
-        if not isinstance(shots, list):
-            raise RuntimeError(f"DeepSeek 返回格式错误，期望数组: {response[:200]}")
+        if not isinstance(parsed, dict):
+            raise RuntimeError(f"DeepSeek 返回格式错误，期望对象: {response[:200]}")
 
-        validated = []
-        for shot in shots:
-            if not isinstance(shot, dict):
+        # 验证 actions
+        valid_actions = []
+        screenshot_count = 0
+        for act in parsed.get("actions", []):
+            if not isinstance(act, dict):
                 continue
-            t = shot.get("time")
-            name = shot.get("name", "")
-            if t is None:
-                continue
-            validated.append({
-                "time": float(t),
-                "name": str(name).strip(),
-            })
+            t = act.get("type", "")
+            if t == "screenshot":
+                if screenshot_count >= 3:
+                    continue  # 超出额度
+                name = act.get("name", "").strip()[:20]
+                if name:
+                    valid_actions.append({"type": "screenshot", "name": name})
+                    screenshot_count += 1
+            elif t in ("seek", "pause", "play"):
+                a = {"type": t}
+                if t == "seek" and "time" in act:
+                    a["time"] = float(act["time"])
+                valid_actions.append(a)
 
-        if not validated:
-            print("[DeepSeek] 警告：未生成任何截图决策")
-
-        return validated
-
-    def summarize_chapter(
-        self,
-        full_subtitle: str,
-        video_title: str = "",
-    ) -> dict:
-        """
-        对整个视频字幕做章节总结（后续实现）。
-
-        返回: {"title": "...", "summary": "...", "segments": [...]}
-        """
-        # TODO: 后续实现
         return {
-            "title": video_title,
-            "summary": "",
-            "segments": [],
+            "summary": str(parsed.get("summary", ""))[:100],
+            "actions": valid_actions,
         }
 
-    @staticmethod
-    def _repair_truncated_json(text: str) -> list:
-        """尝试修复不完整/截断的 JSON 数组。"""
+    # ── 通用聊天（支持动作指令）──
+
+    def chat(
+        self,
+        user_message: str,
+        video_state: dict | None = None,
+        conversation_history: list[dict] | None = None,
+    ) -> dict:
+        """
+        通用聊天接口。DS 可以回复文字，也可以附带动作指令。
+
+        返回: {
+            "reply": "好的，我来帮你...",
+            "actions": [  # 可选，DS 需要执行的操作
+                {"type": "navigate", "url": "https://..."},
+                {"type": "seek", "time": 120.0},
+                {"type": "pause"},
+                {"type": "play"},
+                {"type": "screenshot", "name": "描述"},
+                {"type": "analyze"},          # 启动自动分析
+                {"type": "status"},           # 查看视频状态
+                {"type": "search", "query": "CNN教程"},
+            ]
+        }
+        """
+        if not self._api_key:
+            return {"reply": "未配置 DeepSeek API Key，请在设置中填入密钥。", "actions": []}
+
+        # 构建系统提示
+        state_desc = ""
+        if video_state:
+            t = video_state.get("video_time", 0)
+            d = video_state.get("duration", 0)
+            p = "已暂停" if video_state.get("paused") else "播放中"
+            pl = video_state.get("page_title", "未知")
+            state_desc = (
+                f"\n**当前状态**：\n"
+                f"- 视频: {pl}\n"
+                f"- 进度: {t:.0f}s / {d:.0f}s\n"
+                f"- 状态: {p}\n"
+            )
+
+        system_prompt = CHAT_SYSTEM_PROMPT + state_desc
+
+        messages = [{"role": "system", "content": system_prompt}]
+        if conversation_history:
+            messages.extend(conversation_history[-20:])  # 保留最近20条
+        messages.append({"role": "user", "content": user_message})
+
+        response = self._call(messages, temperature=0.7, max_tokens=2048)
+
+        # 解析 response
+        parsed = self._parse_chat_response(response)
+
+        return parsed
+
+    def _parse_chat_response(self, response: str) -> dict:
+        """解析 DS 的聊天响应，提取文字和动作。"""
         import re
-        # 提取所有 {...} 对象
-        pattern = r'\{\s*"time"\s*:\s*([\d.]+)\s*,\s*"name"\s*:\s*"([^"]*)"\s*\}'
-        matches = re.findall(pattern, text)
-        if matches:
-            return [{"time": float(t), "name": n} for t, n in matches]
 
-        # 兜底：找任何 {time: ..., name: ...} 格式
-        pattern2 = r'"time"\s*:\s*([\d.]+).*?"name"\s*:\s*"([^"]*)"'
-        matches2 = re.findall(pattern2, text)
-        if matches2:
-            return [{"time": float(t), "name": n} for t, n in matches2]
+        result = {"reply": response.strip(), "actions": []}
 
-        return []
+        # 尝试提取 JSON 动作块
+        json_match = re.search(r'```json\s*([\s\S]*?)```', response)
+        if not json_match:
+            json_match = re.search(r'\{[\s\S]*"actions"[\s\S]*\}', response)
+
+        if json_match:
+            json_str = json_match.group(1) if json_match.lastindex else json_match.group(0)
+            try:
+                parsed = json.loads(json_str)
+                if isinstance(parsed, dict):
+                    result["reply"] = parsed.get("reply", result["reply"])
+                    raw_actions = parsed.get("actions", [])
+                    if isinstance(raw_actions, list):
+                        result["actions"] = [a for a in raw_actions if isinstance(a, dict)]
+                    # 去掉 JSON 块，只保留纯文本回复
+                    result["reply"] = result["reply"].strip()
+            except json.JSONDecodeError:
+                pass
+
+        return result
+
+    def _repair_action_json(self, text: str) -> dict:
+        """尝试修复残缺的 JSON。"""
+        import re
+
+        # 提取 summary
+        summary = ""
+        sm = re.search(r'"summary"\s*:\s*"([^"]*)"', text)
+        if sm:
+            summary = sm.group(1)
+
+        # 提取 actions 数组
+        actions = []
+        # 匹配 {"type": "xxx", ...} 模式
+        action_pattern = re.findall(
+            r'\{\s*"type"\s*:\s*"(\w+)"[^}]*\}', text
+        )
+        for atype in action_pattern:
+            if atype in ("seek", "pause", "play", "screenshot", "navigate",
+                         "analyze", "status", "search"):
+                a = {"type": atype}
+                if atype == "seek":
+                    tm = re.search(r'"time"\s*:\s*([\d.]+)', text)
+                    if tm:
+                        a["time"] = float(tm.group(1))
+                if atype == "screenshot":
+                    nm = re.search(r'"name"\s*:\s*"([^"]*)"', text)
+                    if nm:
+                        a["name"] = nm.group(1)[:20]
+                if atype in ("navigate", "search"):
+                    um = re.search(r'"(?:url|query)"\s*:\s*"([^"]*)"', text)
+                    if um:
+                        key = "url" if atype == "navigate" else "query"
+                        a[key] = um.group(1)
+                actions.append(a)
+
+        return {"summary": summary, "actions": actions[:3]}
+
+
+# ── 通用聊天系统提示 ─────────────────────────────────────
+
+CHAT_SYSTEM_PROMPT = """你是 VideoAgent，一个能控制浏览器看视频的 AI 助手。
+
+**你可以做的事**：
+- 打开任意视频网站（帮你导航到 B站、YouTube 等）
+- 跳转到视频的某个时间点
+- 截图当前画面
+- 启动自动分析（边看边截图+总结）
+- 查看视频播放状态
+
+**你的回复格式**（混合文字+JSON）：
+先用自然语言回复用户，**只在需要执行操作时**，附加一个 JSON 块：
+
+```json
+{
+  "reply": "好的，我来帮你跳到 5 分钟的位置。",
+  "actions": [
+    {"type": "seek", "time": 300},
+    {"type": "screenshot", "name": "5分钟截图"}
+  ]
+}
+```
+
+**支持的动作**：
+- navigate(url) — 导航到网址
+- seek(time) — 跳转到指定秒数
+- pause() / play() — 暂停/播放
+- screenshot(name) — 截图，name 用简短中文描述
+- analyze — 启动自动循环分析
+- status — 查看播放状态
+- search(query) — 搜索视频（会打开搜索结果页）
+
+**规则**：
+- 纯聊天时不需要 JSON 块，直接文字回复即可
+- 需要操作浏览器时才附加 JSON
+- 操作视频前确保已连接到浏览器
+- 截图前建议先 pause
+- analyze 命令会启动完整的字幕转录+定时分析流程
+- 用户说"帮我分析"或"开始分析"时 → 执行 analyze
+- 用户说"打开/搜索 xxx 视频"时 → 先用 search 或 navigate
+- 回复简洁友好，中文"""
+
+

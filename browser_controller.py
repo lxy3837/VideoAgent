@@ -17,6 +17,8 @@ import os
 import re
 import time
 import subprocess
+import urllib.request
+import urllib.error
 from datetime import datetime
 from pathlib import Path
 from typing import TypedDict
@@ -29,6 +31,7 @@ except ImportError:
 
 
 CDP_DEFAULT_PORT = 9222
+CDP_SCAN_RANGE = (9222, 9232)  # 扫描端口范围
 EDGE_PATHS = [
     r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
     r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
@@ -63,7 +66,6 @@ def _find_edge() -> str | None:
     for p in EDGE_PATHS:
         if os.path.exists(p):
             return p
-    # 尝试从注册表找
     import winreg
     for key_path in [
         r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe",
@@ -78,71 +80,368 @@ def _find_edge() -> str | None:
     return None
 
 
-def is_cdp_running(port: int = CDP_DEFAULT_PORT) -> bool:
-    """检查 CDP 端口是否已被监听。"""
+def _tcp_ping(host: str, port: int, timeout: float = 1.0) -> bool:
+    """原生 socket 连接，检测端口是否在监听。"""
     import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
     try:
-        s = socket.create_connection(("127.0.0.1", port), timeout=1)
+        s.connect((host, port))
         s.close()
         return True
     except (socket.timeout, ConnectionRefusedError, OSError):
         return False
 
 
-def start_edge_with_cdp(port: int = CDP_DEFAULT_PORT, user_data_dir: str | None = None) -> subprocess.Popen | None:
+def is_cdp_running(port: int = CDP_DEFAULT_PORT) -> bool:
     """
-    以远程调试模式启动 Edge。
-    使用独立 user-data-dir 避免和当前运行的 Edge 冲突。
+    检查 CDP 是否就绪。
+    先 TCP 探活，再 HTTP 验证（绕过 urllib/代理/firewall 干扰）。
+    """
+    # 第一步：原生 TCP socket ping
+    tcp_ok = _tcp_ping("127.0.0.1", port) or _tcp_ping("localhost", port)
+    if not tcp_ok:
+        return False
 
-    返回 subprocess.Popen，失败返回 None。
+    # 第二步：HTTP 请求确认 CDP 服务可用
+    proxy_handler = urllib.request.ProxyHandler({})
+    opener = urllib.request.build_opener(proxy_handler)
+    for host in ["127.0.0.1", "localhost"]:
+        url = f"http://{host}:{port}/json/version"
+        try:
+            req = opener.open(url, timeout=2)
+            data = req.read()
+            req.close()
+            if b"Browser" in data:
+                return True
+        except Exception:
+            continue
+
+    # 第三步：回退 /json/list
+    for host in ["127.0.0.1", "localhost"]:
+        url = f"http://{host}:{port}/json/list"
+        try:
+            req = opener.open(url, timeout=2)
+            data = req.read()
+            req.close()
+            if data.strip().startswith(b"["):
+                return True
+        except Exception:
+            continue
+
+    return False
+
+
+def _kill_and_launch_edge_cdp(port: int = CDP_DEFAULT_PORT, timeout: float = 30.0) -> bool:
+    """杀 Edge → 复制真实 Profile → 用独立 user-data-dir 启动带 CDP 的 Edge。
+    
+    关键：
+    - 显式 --user-data-dir 确保 Edge 创建独立实例，不跟已有实例合并
+    - 复制真实 Profile 保留所有登录态/Cookie
+    - 全程同步执行，不给 Edge 自动复活的机会
+    
+    返回 True 表示 CDP 端口已就绪。
     """
     edge_path = _find_edge()
     if not edge_path:
-        print("[Browser] 找不到 Edge，请确认已安装")
-        return None
+        print("[Browser] 找不到 Edge 安装路径")
+        return False
 
-    if user_data_dir is None:
-        user_data_dir = str(Path(os.environ.get("TEMP", ".")) / "video_agent_edge_cdp")
+    real_profile = os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\User Data")
+    agent_profile = str(Path(os.environ.get("TEMP", ".")) / "video_agent_profile")
 
-    os.makedirs(user_data_dir, exist_ok=True)
+    # 1. 优雅关闭（保存会话）
+    _kill_all_edge(False)
+    time.sleep(2)
 
-    cmd = [
-        edge_path,
-        f"--remote-debugging-port={port}",
-        f"--user-data-dir={user_data_dir}",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--new-window", "about:blank",
+    # 2. 强制清理残留
+    _kill_all_edge(True)
+    time.sleep(0.5)
+
+    # 3. 复制 Profile（仅关键登录数据，非全量拷贝）
+    _copy_profile_fast(real_profile, agent_profile)
+
+    # 4. 启动独立 Edge 实例（独立 user-data-dir → CDP 必定生效）
+    return _start_edge_cdp(edge_path, port, user_data_dir=agent_profile, timeout=timeout)
+
+
+def _copy_profile_fast(src: str, dst: str):
+    """快速复制 Edge Profile 的关键登录数据。
+    
+    不复制 Cache、GPUCache、Code Cache 等大目录。
+    """
+    # 登录相关的关键文件/目录
+    key_items = [
+        # 登录核心
+        "Cookies", "Cookies-journal",
+        "Login Data", "Login Data-journal",
+        "Web Data", "Web Data-journal",
+        # 偏好设置
+        "Preferences",
+        # 存储
+        "Local Storage",
+        "Session Storage",
+        # 扩展和同步
+        "Extensions",
+        "Sync Data",
+        "Bookmarks",
+        # 网络状态
+        "Network",
+        "TransportSecurity",
     ]
 
     try:
+        os.makedirs(dst, exist_ok=True)
+        for item in key_items:
+            src_path = os.path.join(src, item)
+            dst_path = os.path.join(dst, item)
+            if os.path.isdir(src_path):
+                if os.path.exists(dst_path):
+                    shutil.rmtree(dst_path, ignore_errors=True)
+                shutil.copytree(src_path, dst_path)
+            elif os.path.isfile(src_path):
+                shutil.copy2(src_path, dst_path)
+
+        # 复制 Default 目录下的关键文件（Profile 1 默认在这里）
+        default_src = os.path.join(src, "Default")
+        default_dst = os.path.join(dst, "Default")
+        if os.path.isdir(default_src):
+            os.makedirs(default_dst, exist_ok=True)
+            for item in key_items:
+                src_path = os.path.join(default_src, item)
+                dst_path = os.path.join(default_dst, item)
+                if os.path.isdir(src_path):
+                    if os.path.exists(dst_path):
+                        shutil.rmtree(dst_path, ignore_errors=True)
+                    shutil.copytree(src_path, dst_path)
+                elif os.path.isfile(src_path):
+                    shutil.copy2(src_path, dst_path)
+
+        # 写入 First Run 标记（跳过首次引导）
+        with open(os.path.join(dst, "First Run"), "w") as f:
+            f.write("")
+
+        # 写入 Local State（Edge 需要）
+        local_state_src = os.path.join(src, "Local State")
+        if os.path.isfile(local_state_src):
+            shutil.copy2(local_state_src, os.path.join(dst, "Local State"))
+
+        print(f"[Browser] Profile 已复制 ({sum(1 for _ in Path(dst).rglob('*'))} 文件)")
+    except Exception as e:
+        print(f"[Browser] Profile 复制异常（可能部分登录态丢失）: {e}")
+
+
+def _is_edge_running() -> bool:
+    try:
+        result = subprocess.run(
+            ["tasklist", "/fi", "IMAGENAME eq msedge.exe", "/fo", "csv", "/nh"],
+            capture_output=True, text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        return "msedge.exe" in result.stdout
+    except Exception:
+        return False
+
+
+def _kill_all_edge(force: bool = True):
+    """杀掉所有 Edge 相关进程。
+    force=False: 优雅关闭（保存会话），等 3s 后再强制清理残留
+    force=True:  直接强制杀（不保存会话）
+    """
+    names = ["msedge.exe", "msedgewebview2.exe",
+             "MicrosoftEdgeUpdate.exe", "MicrosoftEdgeUpdateCore.exe"]
+
+    if not force:
+        # 先优雅关闭主进程（不加 /f），让 Edge 有机会保存会话
+        try:
+            subprocess.run(
+                ["taskkill", "/t", "/im", "msedge.exe"],
+                capture_output=True,
+                timeout=5,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        except Exception:
+            pass
+        time.sleep(3)  # 等 Edge 写完会话数据
+
+    # 强制清理残留
+    for name in names:
+        try:
+            subprocess.run(
+                ["taskkill", "/f", "/t", "/im", name],
+                capture_output=True,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        except Exception:
+            pass
+
+    try:
+        subprocess.run(
+            ["powershell", "-Command",
+             "Get-Process msedge* -ErrorAction SilentlyContinue | Stop-Process -Force"],
+            capture_output=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except Exception:
+        pass
+
+
+
+import shutil
+
+
+def _start_edge_cdp(edge_path: str, port: int, user_data_dir: str = "", timeout: float = 30.0) -> bool:
+    """直接启动 Edge 可执行文件 + CDP 端口 + 独立 user-data-dir。
+    
+    user_data_dir: 显式指定用户数据目录。如果不指定则用默认目录。
+    关键：必须用独立目录，否则 Edge 会连到已有实例，CDP 参数被忽略。
+    """
+    args = [
+        edge_path,
+        f"--remote-debugging-port={port}",
+        "--restore-last-session",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-background-mode",
+        "--disable-features=msEdgeAutoRestartOnCrash,msEdgeSidebar",
+    ]
+    if user_data_dir:
+        args.insert(1, f"--user-data-dir={user_data_dir}")
+
+    print(f"[Browser] 正在启动 Edge (端口 {port})...")
+    print(f"[Browser] 命令: {edge_path} --remote-debugging-port={port}")
+    try:
         proc = subprocess.Popen(
-            cmd,
+            args,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
-        print(f"[Browser] Edge 已启动 (pid={proc.pid}, cd localhost:{port})")
-        return proc
+        print(f"[Browser] Edge 进程已启动 (PID={proc.pid})")
     except Exception as e:
-        print(f"[Browser] 启动 Edge 失败: {e}")
-        return None
+        print(f"[Browser] Edge 启动失败: {e}")
+        return False
+
+    # 等待 CDP 就绪
+    deadline = time.time() + timeout
+    last_log = 0
+    while time.time() < deadline:
+        if is_cdp_running(port):
+            print(f"[Browser] CDP localhost:{port} 就绪 ✓")
+            return True
+        now = time.time()
+        if now - last_log >= 2.0:
+            # 确认进程还在
+            alive = proc.poll() is None if proc else "?"
+            print(f"[Browser] 等待 CDP... (剩余 {deadline - now:.0f}s, Edge:{'存活' if alive else '已退出'})")
+            last_log = now
+        time.sleep(0.5)
+
+    return False
+
+
+def find_cdp_port(timeout: float = 30.0) -> int:
+    """
+    扫描端口范围找到 Edge 实际监听的 CDP 端口。
+    返回端口号，找不到返回 0。
+    """
+    if is_cdp_running(CDP_DEFAULT_PORT):
+        return CDP_DEFAULT_PORT
+
+    print(f"[Browser] 9222 未响应，扫描端口...")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for port in range(CDP_SCAN_RANGE[0], CDP_SCAN_RANGE[1] + 1):
+            if is_cdp_running(port):
+                print(f"[Browser] 找到 CDP 端口: {port} ✓")
+                return port
+        time.sleep(1)
+    return 0
+
+
+def ensure_edge_cdp(timeout: float = 60.0) -> tuple[int, bool]:
+    """
+    确保 Edge CDP 可用。
+    返回 (port, success)。
+    
+    策略：
+    1. 如果已有 CDP 在监听 → 直接返回端口号
+    2. 没有 → 扫描端口范围
+    3. 还没有 → 杀 Edge → 启动 Edge → 等待 → 扫描
+    """
+    # 策略 1：已有 CDP
+    port = find_cdp_port(timeout=5)
+    if port:
+        return port, True
+
+    # 策略 2：杀 Edge + 重启
+    edge_path = _find_edge()
+    if not edge_path:
+        print("[Browser] 找不到 Edge 安装")
+        return 0, False
+
+    print("[Browser] 未检测到 CDP，正在重启 Edge 调试模式...")
+    _kill_all_edge()
+
+    if _start_edge_cdp(edge_path, CDP_DEFAULT_PORT, timeout=30):
+        return CDP_DEFAULT_PORT, True
+
+    # 策略 3：扫描（Edge 可能用了其他端口）
+    print("[Browser] 9222 超时，尝试扫描其他端口...")
+    port = find_cdp_port(timeout=15)
+    if port:
+        return port, True
+
+    return 0, False
 
 
 # ── 页面查找 ────────────────────────────────────────────
 
 async def _find_video_page(browser: Browser) -> Page | None:
-    """
-    在所有页面中查找包含 <video> 标签的页面。
-    返回第一个找到的页面，没有则返回 None。
+    """在所有页面中查找包含媒体内容的页面。
+
+    策略：
+    1. 优先检查当前活跃（可见）的页签
+    2. 跳过已挂起（discarded）的页签 — 它们 DOM 可能过期，误报 video
+    3. 最后遍历其他活跃页签
     """
     pages = browser.contexts[0].pages if browser.contexts else []
+    if not pages:
+        return None
+
+    # 先按活跃度排序：可见的排前面，挂起的排后面
+    active_pages = []
+    suspended_pages = []
     for page in pages:
         try:
-            has_video = await page.evaluate(
-                "() => !!document.querySelector('video')"
-            )
-            if has_video:
+            is_visible = await page.evaluate("() => document.visibilityState === 'visible'")
+            if is_visible:
+                active_pages.insert(0, page)  # 当前可见的排最前面
+            else:
+                active_pages.append(page)
+        except Exception:
+            suspended_pages.append(page)
+
+    ordered = active_pages + suspended_pages
+
+    for page in ordered:
+        try:
+            # 只检查可见加载完成的页面；挂起的页面 evaluate 会报错自动跳过
+            has_media = await page.evaluate("""
+                () => {
+                    if (document.visibilityState !== 'visible') return false;
+                    return !!(
+                        document.querySelector('video') ||
+                        document.querySelector('audio') ||
+                        document.querySelector('iframe[src*="player"]') ||
+                        document.querySelector('iframe[src*="video"]') ||
+                        document.querySelector('canvas') ||
+                        document.querySelector('[data-player]') ||
+                        document.querySelector('.bpx-player-video-area')
+                    );
+                }
+            """)
+            if has_media:
                 return page
         except Exception:
             continue
@@ -150,7 +449,7 @@ async def _find_video_page(browser: Browser) -> Page | None:
 
 
 async def _get_all_pages(browser: Browser) -> list[dict]:
-    """列出浏览器中所有页面，供 GUI 选择。"""
+    """列出浏览器中所有页面，供 GUI 选择。标注可见页、挂起页。"""
     result = []
     if not browser.contexts:
         return result
@@ -159,41 +458,54 @@ async def _get_all_pages(browser: Browser) -> list[dict]:
             try:
                 title = await page.title()
                 url = page.url
-                has_video = await page.evaluate(
-                    "() => !!document.querySelector('video')"
-                )
+                info = await page.evaluate("""
+                    () => ({
+                        visible: document.visibilityState === 'visible',
+                        hasVideo: !!document.querySelector('video'),
+                        hasAudio: !!document.querySelector('audio'),
+                        hasPlayer: !!(
+                            document.querySelector('iframe[src*="player"]') ||
+                            document.querySelector('iframe[src*="video"]') ||
+                            document.querySelector('canvas') ||
+                            document.querySelector('[data-player]') ||
+                            document.querySelector('.bpx-player-video-area')
+                        ),
+                    })
+                """)
                 result.append({
                     "title": title,
                     "url": url,
-                    "has_video": has_video,
+                    "has_video": info.get("hasVideo", False) or info.get("hasPlayer", False) or info.get("hasAudio", False),
+                    "visible": info.get("visible", True),
                 })
             except Exception:
                 result.append({
-                    "title": "(无法访问)",
+                    "title": "(已挂起/无法访问)",
                     "url": page.url,
                     "has_video": False,
+                    "visible": False,
                 })
     return result
 
 
 # ── 视频状态 ────────────────────────────────────────────
 
-async def _read_video_state(page: Page) -> VideoState | None:
-    """从页面读取视频播放状态（精确到毫秒）。"""
+async def _read_video_state(page: Page, selector: str = "video") -> VideoState | None:
+    """从页面读取视频播放状态（精确到毫秒）。支持自定义 selector。"""
     try:
-        state = await page.evaluate("""
-            () => {
-                const v = document.querySelector('video');
+        state = await page.evaluate(f"""
+            () => {{
+                const v = document.querySelector('{selector}');
                 if (!v) return null;
-                return {
-                    current_time: v.currentTime,
+                return {{
+                    current_time: v.currentTime || 0,
                     duration: v.duration || 0,
                     paused: v.paused,
-                    playback_rate: v.playbackRate,
-                    video_width: v.videoWidth,
-                    video_height: v.videoHeight,
-                };
-            }
+                    playback_rate: v.playbackRate || 1,
+                    video_width: v.videoWidth || 0,
+                    video_height: v.videoHeight || 0,
+                }};
+            }}
         """)
         if state is None:
             return None
@@ -224,11 +536,11 @@ async def _execute_video_action(page: Page, js: str) -> dict:
         return {"ok": False, "error": str(e)}
 
 
-async def _seek_video(page: Page, target_time: float) -> dict:
+async def _seek_video(page: Page, target_time: float, selector: str = "video") -> dict:
     """精确跳转到指定时间（秒）。"""
     return await _execute_video_action(page, f"""
         (() => {{
-            const v = document.querySelector('video');
+            const v = document.querySelector('{selector}');
             if (!v) return {{error: 'no video'}};
             v.currentTime = {target_time};
             return {{currentTime: v.currentTime, paused: v.paused}};
@@ -236,12 +548,12 @@ async def _seek_video(page: Page, target_time: float) -> dict:
     """)
 
 
-async def _toggle_play(page: Page, play: bool) -> dict:
+async def _toggle_play(page: Page, play: bool, selector: str = "video") -> dict:
     """播放或暂停。"""
     action = "v.play()" if play else "v.pause()"
     return await _execute_video_action(page, f"""
         (() => {{
-            const v = document.querySelector('video');
+            const v = document.querySelector('{selector}');
             if (!v) return {{error: 'no video'}};
             {action};
             return {{currentTime: v.currentTime, paused: v.paused}};
@@ -256,9 +568,13 @@ async def _screenshot_video(
     save_dir: str,
     video_time: float,
     name: str,
+    selector: str = "video",
 ) -> CaptureResult:
-    """
-    截取当前视频帧，保存为带语义名称的文件。
+    """截取视频元素当前帧，保存为带语义名称的文件。
+    
+    优先截取视频元素本身（不含页面其他内容），
+    如果视频元素不可用则回退到整页截图。
+    
     文件名格式: {MMSS}s_{name}.png
     """
     os.makedirs(save_dir, exist_ok=True)
@@ -276,14 +592,30 @@ async def _screenshot_video(
 
     filepath = os.path.join(save_dir, filename)
 
-    await page.screenshot(path=filepath, full_page=False)
+    # 优先截取视频元素本身
+    actual_w, actual_h = 0, 0
+    try:
+        element = await page.query_selector(selector)
+        if element:
+            box = await element.bounding_box()
+            if box and box["width"] > 10 and box["height"] > 10:
+                await element.screenshot(path=filepath)
+                actual_w, actual_h = int(box["width"]), int(box["height"])
+            else:
+                # 元素不可见，回退整页截图
+                await page.screenshot(path=filepath, full_page=False)
+        else:
+            # 找不到元素，回退整页截图
+            await page.screenshot(path=filepath, full_page=False)
+    except Exception:
+        await page.screenshot(path=filepath, full_page=False)
 
     return CaptureResult(
         time=video_time,
         name=name,
         path=filepath,
-        width=0,  # 由调用方填充
-        height=0,
+        width=actual_w,
+        height=actual_h,
     )
 
 
@@ -317,48 +649,87 @@ class BrowserController:
         self._page: Page | None = None
         self._proc: subprocess.Popen | None = None
         self._connected = False
+        self._video_selector = "video"  # 可自定义的视频元素 CSS 选择器
 
     # ── 连接 / 断开 ──
 
     async def connect(self, auto_start: bool = True) -> bool:
         """
         连接 Edge CDP。
-        如果端口未监听且 auto_start=True，自动启动 Edge。
+
+        策略：
+          1. 9222 端口已监听 → 直接 connect_over_cdp（秒连，不动浏览器）
+          2. 未监听 → 提示用户用桌面「Edge (调试模式)」快捷方式启动 Edge
+
         返回是否连接成功。
         """
+        t0 = time.time()
         if not HAS_PLAYWRIGHT:
-            print("[Browser] 缺少 playwright，请运行: pip install playwright && playwright install chromium")
+            print("[Browser] 缺少 playwright，请 pip install playwright && playwright install chromium")
             return False
 
-        if not is_cdp_running(self._port):
-            if auto_start:
-                print("[Browser] CDP 端口未监听，正在启动 Edge...")
-                self._proc = start_edge_with_cdp(self._port)
-                # 等 Edge 启动
-                for _ in range(30):
-                    await asyncio.sleep(1)
-                    if is_cdp_running(self._port):
-                        break
-                else:
-                    print("[Browser] Edge 启动超时")
-                    return False
-            else:
-                print(f"[Browser] CDP 端口 {self._port} 未监听，请先启动: msedge.exe --remote-debugging-port={self._port}")
-                return False
-
+        print(f"[Browser] [+{time.time()-t0:.1f}s] 启动 Playwright...")
         self._playwright = await async_playwright().start()
-        try:
-            self._browser = await self._playwright.chromium.connect_over_cdp(
-                f"http://localhost:{self._port}"
-            )
-            self._connected = True
-            print(f"[Browser] 已连接 CDP (localhost:{self._port})")
-            return True
-        except Exception as e:
-            print(f"[Browser] CDP 连接失败: {e}")
+
+        # ── CDP 已就绪 → 直接连 ──
+        print(f"[Browser] [+{time.time()-t0:.1f}s] 检查 CDP (localhost:9222)...")
+        cdp_ok = await asyncio.to_thread(is_cdp_running)
+        if cdp_ok:
+            try:
+                self._browser = await self._playwright.chromium.connect_over_cdp(
+                    f"http://127.0.0.1:{CDP_DEFAULT_PORT}"
+                )
+                self._connected = True
+                self._port = CDP_DEFAULT_PORT
+                print(f"[Browser] [+{time.time()-t0:.1f}s] CDP 连接成功 ✓（不动浏览器，登录态完整）")
+                return True
+            except Exception as e:
+                print(f"[Browser] CDP 连接异常: {e}")
+
+        # ── CDP 未就绪 → 原子化杀+启，用真实 Profile ──
+        print(f"[Browser] [+{time.time()-t0:.1f}s] CDP 未就绪，自动重启 Edge...")
+        if not auto_start:
             await self._playwright.stop()
             self._playwright = None
             return False
+
+        # 关键：杀+启全程在一个同步调用里（asyncio.to_thread），
+        # 中间不 yield，不给 Edge 自动复活的机会
+        launched = await asyncio.to_thread(_kill_and_launch_edge_cdp, CDP_DEFAULT_PORT, 30)
+        if launched:
+            try:
+                self._browser = await self._playwright.chromium.connect_over_cdp(
+                    f"http://127.0.0.1:{CDP_DEFAULT_PORT}"
+                )
+                self._connected = True
+                self._port = CDP_DEFAULT_PORT
+                print(f"[Browser] [+{time.time()-t0:.1f}s] Edge CDP 连接成功 ✓（独立实例 + 登录态）")
+                print(f"[Browser] Profile: %TEMP%\\video_agent_profile")
+                return True
+            except Exception as e:
+                print(f"[Browser] CDP 连接异常: {e}")
+        else:
+            print(f"[Browser] Edge 重启超时")
+            # 兜底：Playwright 临时 Profile
+            print(f"[Browser] [+{time.time()-t0:.1f}s] 兜底：Playwright 独立 Edge...")
+            tmp_dir = str(Path(os.environ.get("TEMP", ".")) / "video_agent_edge")
+            try:
+                context = await self._playwright.chromium.launch_persistent_context(
+                    user_data_dir=tmp_dir,
+                    channel="msedge",
+                    headless=False,
+                    args=["--no-first-run", "--no-default-browser-check"],
+                )
+                self._browser = context.browser
+                self._connected = True
+                print(f"[Browser] [+{time.time()-t0:.1f}s] 独立 Edge 启动成功 ✓（需手动登录）")
+                return True
+            except Exception as e2:
+                print(f"[Browser] 兜底也失败了: {e2}")
+
+        await self._playwright.stop()
+        self._playwright = None
+        return False
 
     async def disconnect(self):
         """断开 CDP 连接，不关浏览器。"""
@@ -405,24 +776,17 @@ class BrowserController:
         return await _get_all_pages(self._browser)
 
     async def select_video_page(self, page_url: str | None = None) -> bool:
-        """
-        定位到包含 <video> 标签的页面。
-        若 page_url 指定，则精确匹配 URL 前缀；否则自动查找。
-
-        返回是否找到。
-        """
+        """定位到包含 <video> 标签的页面。"""
         if not self._browser:
             return False
 
         if page_url:
-            # 精确匹配
             for ctx in self._browser.contexts:
                 for page in ctx.pages:
                     if page.url.startswith(page_url):
                         self._page = page
                         return True
 
-        # 自动查找
         self._page = await _find_video_page(self._browser)
         if self._page:
             print(f"[Browser] 定位到视频页: {await self._page.title()}")
@@ -431,22 +795,181 @@ class BrowserController:
         print("[Browser] 未找到含视频的标签页")
         return False
 
+    async def scan_page_for_media(self) -> dict:
+        """
+        扫描当前页面，返回所有可能的媒体播放器信息。
+        供 LLM 分析后决定使用哪个元素作为视频源。
+
+        返回:
+          {
+            "url": "https://...",
+            "videos": [{tag, id, class, src, width, height, ...}],
+            "iframes": [{src, width, height, ...}],
+            "canvases": [{width, height, ...}],
+            "custom_players": [{selector, className, ...}],
+            "suggestion": "video"  # 默认建议的 selector
+          }
+        """
+        if not self._page:
+            return {"error": "no page selected"}
+
+        try:
+            info = await self._page.evaluate(r"""
+                () => {
+                    const result = {
+                        url: location.href,
+                        title: document.title,
+                        videos: [],
+                        iframes: [],
+                        canvases: [],
+                        custom_players: [],
+                    };
+
+                    // <video> 标签
+                    document.querySelectorAll('video').forEach((v, i) => {
+                        result.videos.push({
+                            index: i,
+                            tag: 'video',
+                            id: v.id || '',
+                            className: v.className || '',
+                            src: (v.src || v.querySelector('source')?.src || ''),
+                            width: v.videoWidth || v.clientWidth || 0,
+                            height: v.videoHeight || v.clientHeight || 0,
+                            duration: v.duration || 0,
+                            paused: v.paused,
+                            currentTime: v.currentTime || 0,
+                            readyState: v.readyState,
+                        });
+                    });
+
+                    // <audio> 标签
+                    document.querySelectorAll('audio').forEach((a, i) => {
+                        result.videos.push({
+                            index: i,
+                            tag: 'audio',
+                            id: a.id || '',
+                            className: a.className || '',
+                            src: (a.src || a.querySelector('source')?.src || ''),
+                            duration: a.duration || 0,
+                            paused: a.paused,
+                        });
+                    });
+
+                    // <iframe> 元素（可能是嵌入式播放器）
+                    document.querySelectorAll('iframe').forEach((f, i) => {
+                        const rect = f.getBoundingClientRect();
+                        if (rect.width > 200 || rect.height > 100) {  // 过滤小 iframe
+                            result.iframes.push({
+                                index: i,
+                                src: f.src || '',
+                                id: f.id || '',
+                                className: f.className || '',
+                                width: rect.width,
+                                height: rect.height,
+                                visible: rect.width > 0 && rect.height > 0,
+                            });
+                        }
+                    });
+
+                    // <canvas> 元素（可能是 WebGL/Canvas 渲染的视频）
+                    document.querySelectorAll('canvas').forEach((c, i) => {
+                        const rect = c.getBoundingClientRect();
+                        if (rect.width > 100 && rect.height > 50) {
+                            result.canvases.push({
+                                index: i,
+                                id: c.id || '',
+                                className: c.className || '',
+                                width: rect.width,
+                                height: rect.height,
+                                visible: rect.width > 0 && rect.height > 0,
+                            });
+                        }
+                    });
+
+                    // 自定义播放器（常见视频网站的播放器容器）
+                    const playerPatterns = [
+                        '.bpx-player-video-area',  // B站
+                        '#bilibili-player',
+                        '.html5-video-player',     // YouTube
+                        '.ytd-player',
+                        '.video-js',               // Video.js
+                        '.jwplayer',
+                        '.tcplayer',               // 腾讯
+                        '.prism-player',           // 阿里
+                        '[data-player]',
+                        '[data-video-id]',
+                        '.dplayer',
+                        '.xgplayer',
+                    ];
+                    playerPatterns.forEach(sel => {
+                        const el = document.querySelector(sel);
+                        if (el) {
+                            const rect = el.getBoundingClientRect();
+                            // 查找内部是否有 video 标签
+                            const innerVideo = el.querySelector('video');
+                            result.custom_players.push({
+                                selector: sel,
+                                tagName: el.tagName.toLowerCase(),
+                                width: rect.width,
+                                height: rect.height,
+                                hasVideoInside: !!innerVideo,
+                                innerVideoSelector: innerVideo ? (
+                                    innerVideo.id ? '#' + innerVideo.id :
+                                    innerVideo.className ? '.' + innerVideo.className.split(' ')[0] :
+                                    'video'
+                                ) : null,
+                            });
+                        }
+                    });
+
+                    // 自动建议最佳选择器
+                    result.suggestion = 'video';
+                    if (result.custom_players.length > 0) {
+                        const p = result.custom_players[0];
+                        if (p.hasVideoInside && p.innerVideoSelector) {
+                            // 如果播放器内部有 video，建议用播放器内的 video
+                            const combined = p.selector + ' ' + p.innerVideoSelector;
+                            result.suggestion = combined.replace(/^\./, '');  // 简化
+                            result.suggestion_detail = combined;
+                        }
+                    }
+                    if (result.videos.length > 0) {
+                        // 优先用最底层的，避免 B 站等多余层
+                        // B站: .bpx-player-video-area video 而不是全局 video
+                        if (result.suggestion === 'video' && result.custom_players.length > 0) {
+                            result.suggestion_detail = result.suggestion;
+                        }
+                    }
+
+                    return result;
+                }
+            """)
+            info["selector"] = self._video_selector  # 当前使用的选择器
+            return info
+        except Exception as e:
+            return {"error": str(e)}
+
+    def set_video_selector(self, selector: str):
+        """设置自定义视频元素选择器（LLM 决定）。例: '.bpx-player-video-area video'"""
+        self._video_selector = selector
+        print(f"[Browser] 视频选择器已更新: {selector}")
+
     # ── 状态 ──
 
     async def get_state(self) -> VideoState | None:
         """获取当前视频播放状态。"""
         if not self._page:
             return None
-        return await _read_video_state(self._page)
+        return await _read_video_state(self._page, self._video_selector)
 
     async def get_current_time(self) -> float:
         """获取当前播放时间（秒）。"""
         if not self._page:
             return 0.0
         try:
-            t = await self._page.evaluate(
-                "document.querySelector('video')?.currentTime ?? 0"
-            )
+            t = await self._page.evaluate(f"""
+                document.querySelector('{self._video_selector}')?.currentTime ?? 0
+            """)
             return float(t)
         except Exception:
             return 0.0
@@ -456,9 +979,9 @@ class BrowserController:
         if not self._page:
             return 0.0
         try:
-            d = await self._page.evaluate(
-                "document.querySelector('video')?.duration ?? 0"
-            )
+            d = await self._page.evaluate(f"""
+                document.querySelector('{self._video_selector}')?.duration ?? 0
+            """)
             return float(d)
         except Exception:
             return 0.0
@@ -467,15 +990,15 @@ class BrowserController:
 
     async def play(self):
         """播放。"""
-        await _toggle_play(self._page, True)
+        await _toggle_play(self._page, True, self._video_selector)
 
     async def pause(self):
         """暂停。"""
-        await _toggle_play(self._page, False)
+        await _toggle_play(self._page, False, self._video_selector)
 
     async def seek(self, target_time: float) -> dict:
         """跳转到指定时间。"""
-        return await _seek_video(self._page, target_time)
+        return await _seek_video(self._page, target_time, self._video_selector)
 
     async def toggle(self) -> bool:
         """切换播放/暂停，返回当前是否在播放。"""
@@ -499,6 +1022,19 @@ class BrowserController:
         await self._page.screenshot(path=save_path, full_page=False)
         return save_path
 
+    async def navigate(self, url: str):
+        """导航到指定 URL（在已连接的页面中打开）。"""
+        if not self._browser:
+            raise RuntimeError("浏览器未连接")
+        # 在现有页面导航
+        if self._page:
+            await self._page.goto(url, wait_until="domcontentloaded")
+        else:
+            ctx = self._browser.contexts[0] if self._browser.contexts else None
+            if ctx:
+                self._page = await ctx.new_page()
+                await self._page.goto(url, wait_until="domcontentloaded")
+
     async def capture_batch(
         self,
         shots: list[dict],
@@ -517,7 +1053,6 @@ class BrowserController:
         if not self._page:
             raise RuntimeError("未定位到视频页面")
 
-        # 记下当前位置
         if restore_time is None:
             restore_time = await self.get_current_time()
 
@@ -527,19 +1062,16 @@ class BrowserController:
             target_time = float(shot["time"])
             name = str(shot.get("name", ""))
 
-            # 跳转
-            await _seek_video(self._page, target_time)
-            await asyncio.sleep(0.5)  # 等画面稳定
+            await _seek_video(self._page, target_time, self._video_selector)
+            await asyncio.sleep(0.5)
 
-            # 截图
             result = await _screenshot_video(
-                self._page, save_dir, target_time, name
+                self._page, save_dir, target_time, name, self._video_selector
             )
             results.append(result)
 
-        # 回到原位
         if restore_time is not None:
-            await _seek_video(self._page, restore_time)
+            await _seek_video(self._page, restore_time, self._video_selector)
             await asyncio.sleep(0.3)
 
         return results

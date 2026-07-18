@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import queue
 import os
+import re
 import threading
 import time
 from datetime import datetime
@@ -75,10 +76,52 @@ class VideoAgent:
 
         # 截图目录
         self._screenshot_dir = ""
+        self._session_dir = ""   # 当前会话文件夹
 
         # 状态
         self._last_video_time = 0.0
         self._video_duration = 0.0
+        self._last_caption_line = 0   # 已读到的字幕行号（防重复）
+        self._chat_history: list[dict] = []  # DS 多轮对话记录
+
+    # ═══════════════════════════════════════════════════════
+    #  密钥管理（写入 .env，重启持久化）
+    # ═══════════════════════════════════════════════════════
+
+    def set_api_key(self, key: str) -> bool:
+        """设置 API Key 并持久化到 .env 文件。返回是否成功。"""
+        key = key.strip()
+        if not key:
+            return False
+
+        # 更新内存中的客户端
+        self._deepseek = DeepSeekClient(api_key=key)
+
+        # 写入 .env（持久化）
+        try:
+            env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+            # 读取现有内容
+            lines = []
+            found = False
+            if os.path.exists(env_path):
+                with open(env_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        if line.startswith("DEEPSEEK_API_KEY="):
+                            lines.append(f"DEEPSEEK_API_KEY={key}\n")
+                            found = True
+                        else:
+                            lines.append(line)
+            if not found:
+                lines.append(f"DEEPSEEK_API_KEY={key}\n")
+
+            with open(env_path, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+
+            self._gui.log(f"API Key 已保存到 {env_path}", "success")
+            return True
+        except Exception as e:
+            self._gui.log(f"保存 API Key 失败: {e}", "error")
+            return False
 
     # ═══════════════════════════════════════════════════════
     #  asyncio 桥接（浏览器操作在线程中运行）
@@ -86,6 +129,8 @@ class VideoAgent:
 
     def _start_async_loop(self):
         """启动 asyncio 事件循环线程（供浏览器操作使用）。"""
+        if self._async_loop is not None and not self._async_loop.is_closed():
+            return  # 已有运行中的事件循环
         def _run_loop():
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
@@ -115,37 +160,34 @@ class VideoAgent:
     #  连接
     # ═══════════════════════════════════════════════════════
 
-    def connect_browser(self) -> bool:
-        """连接 Edge CDP 并自动定位视频页面。"""
-        self._gui.log("正在连接浏览器...", "accent")
+    def _connect_only(self) -> bool:
+        """仅连接浏览器，不查找视频页面。返回是否连上。"""
+        self._gui.log("正在连接浏览器（CDP 直连）...", "accent")
         self._start_async_loop()
-
-        ok = self._run_async(self._browser.connect(auto_start=True))
+        ok = self._run_async(self._browser.connect(auto_start=False))
         if not ok:
             self._gui.log("浏览器连接失败", "error")
-            self._gui.system_say("❌ 浏览器连接失败，请确认 Edge 已安装")
-            self._gui.set_status({"connected": False})
             return False
+        self._gui.log("浏览器已连接 ✓", "success")
+        self._gui.set_status({"connected": True})
+        return True
 
-        self._gui.log("CDP 已连接", "success")
-
-        # 列出页面
+    def _find_video_page(self) -> bool:
+        """在已连接的浏览器中定位视频页面。返回是否找到。"""
         pages = self._run_async(self._browser.list_pages())
         self._gui.log(f"发现 {len(pages)} 个标签页:")
         for i, p in enumerate(pages):
-            icon = "▶" if p["has_video"] else " "
-            self._gui.log(f"  [{i}] {icon} {p['title'][:40]}")
+            icon = "▶" if p.get("has_video") else " "
+            vis = "👁" if p.get("visible") else "💤"
+            title = p['title'][:40] if p['title'] else "(无标题)"
+            self._gui.log(f"  [{i}] {vis} {icon} {title}")
             self._gui.log(f"      {p['url'][:60]}", "dim")
 
-        # 自动定位视频页
         found = self._run_async(self._browser.select_video_page())
         if not found:
-            self._gui.log("未找到含视频的标签页，请在 Edge 中打开视频后重试", "warn")
-            self._gui.system_say("⚠ 未检测到视频标签页。请在 Edge 中打开要分析的视频。")
-            self._gui.set_status({"connected": True, "caption_running": False})
+            self._gui.log("未找到含视频的标签页", "warn")
             return False
 
-        # 获取视频信息
         state = self._run_async(self._browser.get_state())
         if state:
             self._video_duration = state.get("duration", 0)
@@ -156,24 +198,57 @@ class VideoAgent:
                 "success",
             )
             self._gui.set_title(state["page_title"][:40])
-        else:
-            self._gui.log("已定位视频页，无法读取视频状态", "warn")
 
         self._gui.set_status({
             "connected": True,
-            "caption_running": False,
+            "caption_running": self._caption_running,
             "video_time": self._last_video_time,
             "duration": self._video_duration,
         })
-        self._gui.log("浏览器就绪 ✓", "success")
+        self._gui.log("视频页已定位 ✓", "success")
+        return True
+
+    def connect_browser(self, auto_start: bool = False) -> bool:
+        """连接 Edge 并自动定位视频页面。
+
+        auto_start=False: 仅连接已有 CDP
+        auto_start=True:  提示用户用桌面「Edge (调试模式)」快捷方式启动
+        """
+        self._gui.log("正在连接浏览器...", "accent")
+        self._start_async_loop()
+
+        # connect 含自动重启 Edge，给 120s 超时
+        try:
+            ok = self._run_async(self._browser.connect(auto_start=auto_start), timeout=120)
+        except Exception as e:
+            self._gui.log(f"浏览器连接异常: {e}", "error")
+            self._gui.system_say(
+                "浏览器连接超时。请关闭所有 Edge 窗口后重试。"
+            )
+            self._gui.set_status({"connected": False})
+            return False
+        if not ok:
+            self._gui.system_say(
+                "未检测到 Edge 调试模式。\n请关闭 Edge，用桌面「Edge (调试模式)」快捷方式重新打开，再输入「帮我分析」。"
+            )
+            self._gui.set_status({"connected": False})
+            return False
+
+        # CDP 连上了 — 尝试定位视频页
+        self._find_video_page()
         return True
 
     # ═══════════════════════════════════════════════════════
     #  转录
     # ═══════════════════════════════════════════════════════
 
-    def start_caption(self, show_gui: bool = False) -> bool:
-        """启动 Whisper 转录。"""
+    def start_caption(self, show_gui: bool = False, save_dir: str = "") -> bool:
+        """启动 Whisper 转录。
+
+        Args:
+            show_gui: 是否显示悬浮字幕窗
+            save_dir: 字幕保存目录（默认脚本根目录）
+        """
         if not HAS_TRANSCRIBER:
             self._gui.log("转录模块未安装，请检查 transcriber_core.py", "error")
             return False
@@ -184,13 +259,12 @@ class VideoAgent:
 
         import queue as qmod
 
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        self._screenshot_dir = os.path.join(script_dir, "screenshots")
-        os.makedirs(self._screenshot_dir, exist_ok=True)
+        if not save_dir:
+            save_dir = os.path.dirname(os.path.abspath(__file__))
 
-        # 日志路径（和原来一致: captions_YYYYMMDD.txt）
+        # 字幕文件写入指定目录
         self._caption_log_path = os.path.join(
-            script_dir, f"captions_{datetime.now().strftime('%Y%m%d')}.txt"
+            save_dir, f"captions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         )
         self._caption_start_time = time.time()
 
@@ -231,7 +305,7 @@ class VideoAgent:
         self._gui.log("字幕录制已停止", "accent")
 
     def _read_caption_log(self, tail: int = 100) -> str:
-        """读取字幕日志，返回最近 N 行（过滤掉标题和分隔符）。"""
+        """读取字幕日志，返回最近 N 行（过滤掉标题和分隔符）。用于一次性查看。"""
         if not self._caption_log_path or not os.path.exists(self._caption_log_path):
             return ""
         with open(self._caption_log_path, "r", encoding="utf-8") as f:
@@ -242,6 +316,37 @@ class VideoAgent:
         ]
         recent = content[-tail:] if len(content) > tail else content
         return "\n".join(recent)
+
+    def _read_new_captions(self, max_lines: int = 80) -> str:
+        """只读上次分析之后新增的字幕行，避免 DS 重复处理。
+
+        用行号追踪：记录已读行数，每次只取新增的。
+        首次调用返回最近 max_lines 行。
+        """
+        if not self._caption_log_path or not os.path.exists(self._caption_log_path):
+            return ""
+
+        with open(self._caption_log_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+        content = [
+            l.rstrip() for l in lines
+            if not l.startswith("===") and l.strip() != "---" and l.strip()
+        ]
+
+        if self._last_caption_line >= len(content):
+            return ""  # 没有新行
+
+        # 取新增的行
+        new_lines = content[self._last_caption_line:]
+        # 更新进度
+        self._last_caption_line = len(content)
+
+        # 限制最大行数
+        if len(new_lines) > max_lines:
+            new_lines = new_lines[-max_lines:]
+
+        return "\n".join(new_lines)
 
     # ═══════════════════════════════════════════════════════
     #  分析循环
@@ -269,19 +374,23 @@ class VideoAgent:
         """
         分析主循环（运行在后台线程）。
 
-        流程:
-          1. 等待字幕积累一段时间
-          2. 读取最近字幕 → DeepSeek 分析 → 批量截图
-          3. 重复
+        每分钟一轮：
+          1. 读视频状态（时间 + 暂停/播放）→ 喂给 DS
+          2. 读最近 60s 字幕
+          3. DS 返回动作列表（seek → pause → screenshot → play）
+          4. 按序执行动作
+          5. 等 60s，重复
         """
         if not self._browser.has_video_page:
             self._gui.log("未连接视频页，分析中止", "error")
             self._analyzing = False
             return
 
-        # 先等字幕积累 30 秒
-        self._gui.log("等待字幕积累 (30s)...", "dim")
-        for _ in range(30):
+        # 先等字幕积累 60 秒
+        self._gui.assistant_say("⏳ 等待字幕积累 60 秒后开始首轮分析...")
+        self._gui.log("等待字幕积累 (60s)...", "dim")
+        self._last_caption_line = 0  # 重置已读行号
+        for _ in range(60):
             if self._stop_requested:
                 self._analyzing = False
                 return
@@ -290,14 +399,35 @@ class VideoAgent:
         round_num = 0
         while not self._stop_requested and self._analyzing:
             round_num += 1
-            self._gui.log(f"--- 分析轮次 {round_num} ---", "accent")
+            self._gui.log(f"--- 第 {round_num} 轮分析 ---", "accent")
 
-            # 1. 更新视频状态
+            # 1. 获取视频状态
+            video_state = {}
             try:
                 state = self._run_async(self._browser.get_state())
                 if state:
                     self._last_video_time = state["current_time"]
                     self._video_duration = state.get("duration", 0)
+                    video_state = {
+                        "video_time": self._last_video_time,
+                        "duration": self._video_duration,
+                        "paused": state.get("paused", False),
+                    }
+                    icon = "⏸" if state.get("paused") else "▶"
+                    self._gui.log(
+                        f"状态: {icon} {self._last_video_time:.0f}s / {self._video_duration:.0f}s | "
+                        f"选择器: {self._browser._video_selector}",
+                        "dim",
+                    )
+
+                    # 检测视频是否播完
+                    dur = self._video_duration
+                    if dur > 0 and self._last_video_time > 0:
+                        remaining = dur - self._last_video_time
+                        if remaining <= 3 or (state.get("paused") and remaining <= 10):
+                            self._gui.log(f"视频已播完 (剩余 {remaining:.0f}s)，处理最后一轮后停止", "accent")
+                            self._gui.assistant_say("视频已接近尾声，最后检查一次...")
+                            self._stop_requested = True  # 本轮之后停止
                 self._gui.set_status({
                     "connected": True,
                     "caption_running": self._caption_running,
@@ -307,60 +437,112 @@ class VideoAgent:
             except Exception as e:
                 self._gui.log(f"读取视频状态失败: {e}", "error")
 
-            # 2. 读字幕
-            subtitle = self._read_caption_log(tail=80)
-            if not subtitle.strip():
-                self._gui.log("字幕为空，等待中...", "dim")
+            # 2. 读字幕（只读新增，不重复）
+            src_name = os.path.basename(self._caption_log_path) if self._caption_log_path else "?"
+            subtitle = self._read_new_captions(max_lines=80)
+            line_count = subtitle.count("\n") + 1 if subtitle.strip() else 0
+            if line_count == 0:
+                self._gui.log("字幕为空，跳过本轮", "dim")
                 time.sleep(10)
                 continue
 
-            line_count = subtitle.count("\n") + 1
-            self._gui.log(f"字幕: {line_count} 行", "dim")
+            self._gui.log(
+                f"DS 读取: {src_name} (最近 {line_count} 行) | 内容预览: {subtitle[:80].strip()}...",
+                "dim",
+            )
 
-            # 3. DeepSeek 分析
+            # 3. DeepSeek 分析（带视频状态）
             try:
-                self._gui.log("DeepSeek 分析中...", "accent")
-                shots = self._deepseek.analyze_screenshots(subtitle)
+                self._gui.log("→ 发送给 DeepSeek...", "accent")
+                result = self._deepseek.analyze_screenshots(subtitle, video_state)
+                summary = result.get("summary", "")
+                actions = result.get("actions", [])
+                screenshot_count = sum(1 for a in actions if a["type"] == "screenshot")
                 self._gui.log(
-                    f"DeepSeek 生成 {len(shots)} 个截图点: {[s['name'] for s in shots]}",
+                    f"DS 返回: {screenshot_count} 张截图, {len(actions)} 个动作",
                     "success",
                 )
-                self._gui.assistant_say(
-                    f"本段字幕分析结果：\n" +
-                    "\n".join(f"  • {s['time']:.0f}s — {s['name']}" for s in shots)
-                )
+                if summary:
+                    self._gui.assistant_say(f"[第{round_num}轮] {summary}")
             except Exception as e:
-                self._gui.log(f"DeepSeek 分析失败: {e}", "error")
+                self._gui.log(f"DeepSeek 异常: {e}", "error")
                 time.sleep(10)
                 continue
 
-            if not shots:
-                self._gui.log("无截图点，跳过", "dim")
-                time.sleep(15)
+            if not actions:
+                self._gui.log("本轮无截图 (DS 跳过)", "dim")
+                time.sleep(10)
                 continue
 
-            # 4. 批量截图
+            # 4. 按序执行动作
+            self._gui.log(f"执行 {len(actions)} 个动作:", "accent")
             try:
-                self._gui.log(f"批量截图 {len(shots)} 张...", "accent")
-                results = self._run_async(
-                    self._browser.capture_batch(shots, save_dir=self._screenshot_dir)
-                )
-                for r in results:
-                    fname = os.path.basename(r["path"])
-                    self._gui.log(f"  ✓ {fname}", "success")
+                for act in actions:
+                    if self._stop_requested:
+                        break
+                    atype = act["type"]
+                    if atype == "seek":
+                        t = act.get("time", 0)
+                        r = self._run_async(self._browser.seek(t))
+                        ok = "" if r.get("ok") else f" 失败: {r.get('error')}"
+                        self._gui.log(f"  ⏩ seek {t:.0f}s{ok}", "dim")
+                        time.sleep(0.5)
+                    elif atype == "pause":
+                        self._run_async(self._browser.pause())
+                        self._gui.log("  ⏸ pause", "dim")
+                        time.sleep(0.3)
+                    elif atype == "screenshot":
+                        name = act.get("name", "截图")
+                        current_time = self._run_async(
+                            self._browser.get_current_time()
+                        )
+                        results = self._run_async(
+                            self._browser.capture_batch(
+                                [{"time": current_time, "name": name}],
+                                save_dir=self._screenshot_dir,
+                            )
+                        )
+                        for r in results:
+                            fname = os.path.basename(r["path"])
+                            size = os.path.getsize(r["path"])
+                            self._gui.log(f"  📸 {fname} ({size//1024}KB)", "success")
+                    elif atype == "play":
+                        self._run_async(self._browser.play())
+                        self._gui.log("  ▶ play", "dim")
+                        time.sleep(0.2)
             except Exception as e:
-                self._gui.log(f"截图失败: {e}", "error")
+                self._gui.log(f"动作异常: {e}", "error")
 
-            # 5. 等 30 秒再分析下一段
-            self._gui.log(f"等待 30s 后分析下一段...", "dim")
-            for _ in range(30):
+            # 5. 等 60 秒再分析下一段
+            self._gui.log("等待 60s 后分析下一段...", "dim")
+            for _ in range(60):
                 if self._stop_requested:
                     break
                 time.sleep(1)
 
+        # 分析结束
         self._analyzing = False
+        self._finish_session()
+
+    def _finish_session(self):
+        """分析结束后：统计截图数量。字幕已在会话文件夹中，无需复制。"""
+        if not self._session_dir or not os.path.isdir(self._session_dir):
+            self._gui.log("分析循环已结束", "accent")
+            self._gui.system_say("✅ 分析完成！")
+            return
+
+        # 统计截图
+        screenshot_count = 0
+        screenshot_dir = os.path.join(self._session_dir, "screenshots")
+        if os.path.isdir(screenshot_dir):
+            screenshot_count = sum(1 for f in os.listdir(screenshot_dir) if f.endswith(".png"))
+
         self._gui.log("分析循环已结束", "accent")
-        self._gui.system_say("✅ 分析完成！")
+        self._gui.system_say(
+            f"✅ 分析完成！\n"
+            f"共 {screenshot_count} 张截图\n"
+            f"保存位置: sessions/{os.path.basename(self._session_dir)}/"
+        )
 
     # ═══════════════════════════════════════════════════════
     #  用户指令处理（来自 GUI 聊天框）
@@ -372,8 +554,19 @@ class VideoAgent:
         text_raw = text.strip()
 
         # ── 一键启动：帮我分析 ──
-        if any(kw in text_raw for kw in ("帮我分析", "分析这个视频", "分析视频", "分析一下")):
+        if any(kw in text_raw for kw in ("新会话", "新建会话", "开新的")):
+            self._session_dir = ""  # 清空，强制新建
+            self._gui.assistant_say("将创建新会话...")
             self._one_click_analyze()
+            return
+
+        if any(kw in text_raw for kw in ("帮我分析", "分析这个视频", "分析视频", "分析一下", "继续分析")):
+            self._one_click_analyze()
+            return
+
+        # ── 扫描播放器 ──
+        if any(kw in text_raw for kw in ("扫描播放器", "扫描视频", "检测播放器", "识别视频")):
+            self._scan_player()
             return
 
         # ── 设置密钥 ──
@@ -382,18 +575,26 @@ class VideoAgent:
             if len(parts) >= 2:
                 key = parts[1].strip()
                 if key:
-                    self._deepseek = DeepSeekClient(api_key=key)
-                    self._gui.log("API Key 已更新 ✓", "success")
-                    self._gui.assistant_say("✅ API Key 已更新！现在可以开始分析了。")
+                    ok = self.set_api_key(key)
+                    if ok:
+                        self._gui.assistant_say("✅ API Key 已保存，重启也有效！现在可以开始分析了。")
+                    else:
+                        self._gui.assistant_say("❌ 密钥保存失败，请检查文件权限。")
                     return
             self._gui.assistant_say("格式: 设置密钥 sk-xxxxxxxx")
             return
 
         # ── 启动分析 ──
         if text_lower in ("开始分析", "start", "分析", "go"):
-            if not self._browser.connected or not self._browser.has_video_page:
-                self._gui.assistant_say("请先连接浏览器并打开视频页面。可以输入「连接浏览器」或直接说「帮我分析这个视频」。")
+            if not self._browser.connected:
+                self._gui.assistant_say("请先连接浏览器。输入「帮我分析」自动处理。")
                 return
+            if not self._browser.has_video_page:
+                self._gui.assistant_say("浏览器已连接，但未检测到视频。请在 Edge 中打开视频页面，然后输入「开始分析」。")
+                # 再尝试找一次
+                self._find_video_page()
+                if not self._browser.has_video_page:
+                    return
             if not self._caption_running:
                 self._gui.assistant_say("字幕录制尚未开始。正在启动...")
                 self.start_caption()
@@ -409,9 +610,24 @@ class VideoAgent:
             if self._browser.connected:
                 self._gui.assistant_say("浏览器已连接。输入「帮我分析」开始自动分析。")
             else:
-                ok = self.connect_browser()
+                ok = self.connect_browser(auto_start=False)
                 if ok:
-                    self._gui.assistant_say("✅ 浏览器连接成功！输入「帮我分析」开始分析。")
+                    self._gui.assistant_say("浏览器连接成功！输入「帮我分析」开始分析。")
+
+        # ── 启动 Edge 调试模式 ──
+        elif text_lower in ("启动 edge", "启动edge", "edge 调试", "打开 edge", "自动启动 edge"):
+            self._gui.assistant_say("正在启动 Edge 调试模式...")
+            ok = self.connect_browser(auto_start=True)
+            if ok:
+                self._gui.assistant_say(
+                    "Edge 已启动！请在 Edge 中打开你要分析的视频，\n"
+                    "然后输入「帮我分析」开始。"
+                )
+            else:
+                self._gui.assistant_say(
+                    "Edge 启动失败。请手动启动：\n"
+                    "  msedge.exe --remote-debugging-port=9222"
+                )
 
         # ── 状态 ──
         elif text_lower in ("状态", "status"):
@@ -436,38 +652,195 @@ class VideoAgent:
             self._gui.assistant_say(
                 "可用指令：\n"
                 "  • 帮我分析这个视频 — 一键启动\n"
-                "  • 连接浏览器 — 单独连接\n"
+                "  • 连接浏览器 — 连到已开启 CDP 的 Edge\n"
+                "  • 启动 Edge — 自动开启 Edge 调试模式\n"
                 "  • 开始分析 — 仅启动分析\n"
                 "  • 停止 — 停止分析\n"
                 "  • 截图 — 手动截图当前帧\n"
                 "  • 状态 — 查看当前状态\n"
-                "  • 设置密钥 sk-xxx — 配置 API Key\n\n"
-                "也可以直接输入自然语言指令，如「多截一些代码相关的图」"
+                "  • 设置密钥 sk-xxx — 配置 API Key\n"
+                "\n"
+                "也可以直接输入自然语言指令，如「帮我找CNN教程」「跳到10分钟」「总结一下」"
             )
 
-        # ── 自然语言自定义分析 ──
+        # ── 通用 DS 聊天（所有未匹配的指令都发给 DeepSeek）──
         else:
-            if not self._caption_running:
-                self._gui.assistant_say("字幕尚未启动。输入「帮我分析」启动完整流程。")
-                return
-            subtitle = self._read_caption_log(tail=80)
-            if not subtitle.strip():
-                self._gui.assistant_say("暂无字幕数据，请等待...")
-                return
+            threading.Thread(target=self._handle_ds_chat, args=(text_raw,), daemon=True).start()
+
+    def _handle_ds_chat(self, text: str):
+        """将用户消息发给 DeepSeek 聊天，执行返回的动作。"""
+        if not self._deepseek.configured:
+            self._gui.assistant_say("请先配置 DeepSeek API Key。输入「设置密钥 sk-xxx」或在 ⚙ 面板中设置。")
+            return
+
+        self._gui.log(f"DS 聊天: {text[:50]}", "accent")
+
+        # 收集当前状态
+        video_state = None
+        try:
+            if self._browser.has_video_page:
+                state = self._run_async(self._browser.get_state())
+                if state:
+                    video_state = {
+                        "video_time": state.get("current_time", 0),
+                        "duration": state.get("duration", 0),
+                        "paused": state.get("paused", False),
+                        "page_title": state.get("page_title", ""),
+                    }
+        except Exception:
+            pass
+
+        try:
+            result = self._deepseek.chat(
+                user_message=text,
+                video_state=video_state,
+                conversation_history=self._chat_history,
+            )
+        except Exception as e:
+            self._gui.assistant_say(f"DeepSeek 调用失败: {e}")
+            return
+
+        reply = result.get("reply", "")
+        actions = result.get("actions", [])
+
+        # 显示 DS 回复
+        if reply:
+            self._gui.assistant_say(reply)
+        else:
+            self._gui.assistant_say("收到！")  # 兜底
+
+        # 记录对话
+        self._chat_history.append({"role": "user", "content": text})
+        self._chat_history.append({"role": "assistant", "content": reply})
+
+        # 限制历史长度
+        if len(self._chat_history) > 40:
+            self._chat_history = self._chat_history[-40:]
+
+        # 执行动作
+        if actions:
+            self._gui.log(f"DS 返回 {len(actions)} 个动作: {[a.get('type') for a in actions]}", "dim")
+            self._execute_ds_actions(actions)
+
+    def _execute_ds_actions(self, actions: list[dict]):
+        """执行 DeepSeek 返回的动作指令。"""
+        if not self._browser.connected or not self._browser.has_video_page:
+            for a in actions:
+                t = a.get("type", "")
+                if t in ("analyze", "seek", "pause", "play", "screenshot"):
+                    self._gui.assistant_say("请先连接浏览器。输入「帮我分析」自动处理。")
+                    return
+
+        for act in actions:
+            t = act.get("type", "")
             try:
-                self._gui.log(f"自定义分析: {text_raw}", "accent")
-                shots = self._deepseek.analyze_screenshots(subtitle, custom_instruction=text_raw)
-                self._gui.assistant_say(
-                    f"根据你的要求分析结果：\n" +
-                    "\n".join(f"  • {s['time']:.0f}s — {s['name']}" for s in shots)
-                )
+                if t == "seek":
+                    target = float(act.get("time", 0))
+                    self._run_async(self._browser.seek(target))
+                    self._gui.log(f"  ⏩ seek {target:.0f}s", "dim")
+                    self._last_video_time = target
+
+                elif t == "pause":
+                    self._run_async(self._browser.pause())
+                    self._gui.log("  ⏸ pause", "dim")
+
+                elif t == "play":
+                    self._run_async(self._browser.play())
+                    self._gui.log("  ▶ play", "dim")
+
+                elif t == "screenshot":
+                    name = act.get("name", "截图")
+                    self._screenshot_at_current(name)
+
+                elif t == "navigate":
+                    url = act.get("url", "")
+                    if url:
+                        self._gui.log(f"  导航: {url}", "dim")
+                        self._run_async(self._browser.navigate(url))
+                        self._gui.assistant_say(f"已打开 {url}")
+
+                elif t == "search":
+                    query = act.get("query", "")
+                    if query:
+                        search_url = f"https://www.bilibili.com/search?keyword={query}"
+                        self._gui.log(f"  搜索: {query}", "dim")
+                        self._run_async(self._browser.navigate(search_url))
+                        self._gui.assistant_say(f"已搜索: {query}")
+
+                elif t == "analyze":
+                    self._one_click_analyze()
+                    return  # analyze 是完整流程，后面的动作没必要了
+
+                elif t == "status":
+                    self._show_status()
+
             except Exception as e:
-                self._gui.assistant_say(f"分析失败: {e}")
+                self._gui.log(f"  动作 {t} 失败: {e}", "warn")
+
+    def _screenshot_at_current(self, name: str):
+        """在当前时间点截图并命名。"""
+        if not self._browser.has_video_page:
+            self._gui.assistant_say("未连接到视频页面。")
+            return
+        try:
+            t = self._run_async(self._browser.get_current_time())
+            self._last_video_time = t
+            # 确保有保存目录
+            if not self._screenshot_dir:
+                self._screenshot_dir = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), "screenshots"
+                )
+            os.makedirs(self._screenshot_dir, exist_ok=True)
+            minutes = int(t // 60)
+            seconds = int(t % 60)
+            safe_name = re.sub(r'[\\/:*?"<>|]', '_', name).strip().replace(" ", "_")[:30]
+            fname = f"{minutes:02d}{seconds:02d}s_{safe_name}.png"
+            path = os.path.join(self._screenshot_dir, fname)
+            self._run_async(self._browser.screenshot(path))
+            size_kb = os.path.getsize(path) // 1024
+            self._gui.log(f"  📸 {fname} ({size_kb}KB)", "success")
+            self._gui.assistant_say(f"📸 已截图: {fname}")
+        except Exception as e:
+            self._gui.log(f"  截图失败: {e}", "warn")
+            self._gui.assistant_say(f"截图失败: {e}")
+
+    def _show_status(self):
+        """在聊天中显示当前状态。"""
+        lines = [
+            f"浏览器: {'已连接' if self._browser.connected else '未连接'}",
+            f"视频页: {'已定位' if self._browser.has_video_page else '未定位'}",
+            f"字幕: {'录制中' if self._caption_running else '未启动'}",
+            f"分析: {'运行中' if self._analyzing else '空闲'}",
+        ]
+        if self._video_duration > 0:
+            lines.append(f"进度: {self._last_video_time:.0f}s / {self._video_duration:.0f}s")
+        self._gui.assistant_say("\n".join(lines))
+
+    def _get_safe_video_title(self) -> str:
+        """从当前视频页面获取安全的文件夹名。"""
+        try:
+            state = self._run_async(self._browser.get_state(), timeout=5)
+            if state:
+                title = state.get("page_title", "")
+                if title:
+                    # 去掉常见后缀和特殊字符
+                    title = re.sub(r'\s*[-|—–]\s*.*?(?:Bilibili|YouTube|bilibili|哔哩).*$', '', title)
+                    title = re.sub(r'[\\/:*?"<>|]', '_', title)  # Windows 非法字符
+                    title = re.sub(r'\s+', '_', title.strip())
+                    title = title[:40]  # 限制长度
+                    return title
+        except Exception:
+            pass
+        return ""
 
     # ── 一键分析 ──
 
     def _one_click_analyze(self):
-        """一键启动完整流程：连接浏览器 → 启动字幕 → 开始分析。"""
+        """一键启动完整流程：连接浏览器 → 启动字幕 → 开始分析。
+
+        如果已有活跃会话，自动续接（不新建文件夹）。
+        输入「新会话」强制开新的。
+        """
         if not self._deepseek.configured:
             self._gui.assistant_say(
                 "⚠ 尚未配置 DeepSeek API Key。\n"
@@ -475,29 +848,85 @@ class VideoAgent:
             )
             return
 
-        self._gui.assistant_say("🤖 收到！正在启动分析流程...")
+        # 已在分析中 → 直接返回
+        if self._analyzing:
+            self._gui.assistant_say("分析已在运行中，无需重复启动。输入「停止」可终止。")
+            return
+
+        # 已有会话且字幕在运行 → 续接，不新建文件夹
+        if self._session_dir and self._caption_running:
+            self._gui.log(f"续接会话: {os.path.basename(self._session_dir)}/", "accent")
+            self._gui.assistant_say("检测到已有活跃会话，继续分析...")
+            self.start_analysis()
+            return
+
+        self._gui.assistant_say("收到！正在启动分析流程...")
         self._gui.log("「帮我分析」一键启动", "accent")
 
-        # Step 1: 连接浏览器
+        # Step 1: 确保浏览器可用
         if not self._browser.connected:
             self._gui.assistant_say("第一步：连接浏览器...")
-            ok = self.connect_browser()
+            ok = self.connect_browser(auto_start=True)
             if not ok:
                 self._gui.assistant_say(
-                    "❌ 浏览器连接失败。\n请确保 Edge 以调试模式运行后输入「连接浏览器」重试。"
+                    "浏览器启动失败。请确认 Edge 已安装且任务管理器中没有残留的 msedge 进程。"
                 )
                 return
+            self._gui.assistant_say("浏览器已连接 ✓")
 
-        # Step 2: 启动字幕
+        # Step 1.5: 检查是否有视频页面
+        if not self._browser.has_video_page:
+            # 尝试智能扫描——可能不是标准 <video> 标签
+            self._gui.log("标准检测未找到视频，尝试智能扫描...", "accent")
+            scan = self._run_async(self._browser.scan_page_for_media(), timeout=10)
+            if isinstance(scan, dict) and scan.get("custom_players"):
+                cp = scan["custom_players"]
+                self._gui.log(f"发现 {len(cp)} 个自定义播放器: {[p['selector'] for p in cp]}", "dim")
+                # 自动选择第一个内置 video 的播放器
+                for p in cp:
+                    if p.get("hasVideoInside"):
+                        sel = f"{p['selector']} video"
+                        self._browser.set_video_selector(sel)
+                        self._gui.log(f"自动选择视频选择器: {sel}", "success")
+                        self._gui.assistant_say(f"✓ 已智能识别视频播放器 ({p['selector']})")
+                        # 重新确认有视频页
+                        self._find_video_page()
+                        break
+                if not self._browser.has_video_page:
+                    self._gui.assistant_say(
+                        "检测到播放器但内部无标准 video 标签。\n"
+                        "建议对 AI 说「扫描播放器」获取详细信息。"
+                    )
+                    return
+            else:
+                self._gui.assistant_say(
+                    "浏览器已连接，但未检测到视频标签页。\n"
+                    "请在 Edge 中打开要分析的视频页面，然后输入「开始分析」。"
+                )
+                self._gui.log("未检测到视频标签页，请在 Edge 中打开视频后输入「开始分析」", "warn")
+                return
+
+        # Step 1: 创建会话文件夹（用视频标题命名）
+        safe_title = self._get_safe_video_title()
+        session_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        folder_name = f"{session_ts}_{safe_title}" if safe_title else session_ts
+        self._session_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "sessions", folder_name
+        )
+        self._screenshot_dir = os.path.join(self._session_dir, "screenshots")
+        os.makedirs(self._screenshot_dir, exist_ok=True)
+        self._gui.log(f"会话文件夹: sessions/{folder_name}/", "accent")
+
+        # Step 2: 启动字幕（写入会话文件夹）
         if not self._caption_running:
             self._gui.assistant_say("第二步：启动字幕录制...")
-            ok = self.start_caption()
+            ok = self.start_caption(save_dir=self._session_dir)
             if not ok:
                 self._gui.assistant_say("❌ 字幕启动失败，请检查依赖。")
                 return
 
         # Step 3: 开始分析
-        self._gui.assistant_say("第三步：开始自动分析！🎬")
+        self._gui.assistant_say("第三步：开始自动分析！")
         self.start_analysis()
 
     def _manual_screenshot(self):
@@ -529,6 +958,62 @@ class VideoAgent:
                 pass
         self._stop_async_loop()
         self._gui.log("VideoAgent 已关闭", "dim")
+
+    def _scan_player(self):
+        """扫描当前页面的媒体播放器，LLM 辅助识别。"""
+        if not self._browser.connected or not self._browser.has_video_page:
+            self._gui.assistant_say("请先连接浏览器并打开视频页面。")
+            return
+
+        self._gui.log("扫描页面媒体元素...", "accent")
+        try:
+            scan = self._run_async(self._browser.scan_page_for_media(), timeout=10)
+        except Exception as e:
+            self._gui.assistant_say(f"扫描失败: {e}")
+            return
+
+        if "error" in scan:
+            self._gui.assistant_say(f"扫描出错: {scan['error']}")
+            return
+
+        # 构建给 LLM 的提示
+        summary = f"页面: {scan.get('title', '?')}\n"
+        summary += f"URL: {scan.get('url', '?')}\n"
+        summary += f"当前选择器: {scan.get('selector', 'video')}\n\n"
+
+        videos = scan.get("videos", [])
+        if videos:
+            summary += f"### 标准媒体标签 ({len(videos)} 个)\n"
+            for v in videos:
+                summary += f"- <{v['tag']}> id={v['id']!r} class={v['className']!r}"
+                summary += f" {v['width']}x{v['height']}"
+                if v.get('duration'):
+                    summary += f" 时长={v['duration']:.0f}s"
+                summary += "\n"
+
+        custom = scan.get("custom_players", [])
+        if custom:
+            summary += f"\n### 自定义播放器 ({len(custom)} 个)\n"
+            for p in custom:
+                summary += f"- {p['selector']} ({p['tagName']}) {p['width']}x{p['height']}"
+                if p.get('hasVideoInside'):
+                    summary += f" [内部有video: {p['innerVideoSelector']}]"
+                summary += "\n"
+
+        iframes = scan.get("iframes", [])
+        if iframes:
+            summary += f"\n### 大尺寸 iframe ({len(iframes)} 个)\n"
+            for f in iframes[:5]:
+                summary += f"- {f['src'][:80]} {f['width']}x{f['height']}\n"
+
+        self._gui.log(summary, "dim")
+        self._gui.assistant_say(f"📊 页面扫描完成：\n{summary[:1000]}")
+
+        # 如果有建议的选择器，自动应用
+        suggestion = scan.get("suggestion", "video")
+        if suggestion != "video" and suggestion != scan.get("selector", "video"):
+            self._browser.set_video_selector(suggestion)
+            self._gui.assistant_say(f"✅ 已自动切换选择器: `{suggestion}`")
 
 
 # 类型引用（避免循环导入）

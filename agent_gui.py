@@ -169,38 +169,45 @@ class AgentGUI:
         )
         self._status_time.pack(side="right")
 
-        # ── 聊天区（主区域，占大部分） ──
+        # ── 聊天标签 ──
         chat_label = tk.Label(
             self._main_frame, text="  💬 聊天", font=(FONT_FAMILY, 9),
             fg=DIM_COLOR, bg=BG_COLOR, anchor="w",
         )
         chat_label.pack(fill="x", padx=4, pady=(2, 0))
 
-        # 聊天容器：chat_text 在上，输入框在下
-        chat_container = tk.Frame(self._main_frame, bg=BG_COLOR)
-        chat_container.pack(fill="both", expand=True, padx=0, pady=0)
+        # ═══════════════════════════════════════════════════
+        #  关键: 先 pack 侧=bottom 的固定高度内容，它们抢占底部空间
+        #  再 pack 侧=top 的 _chat_text(expand=True)，它填满中间
+        # ═══════════════════════════════════════════════════
 
-        self._chat_text = scrolledtext.ScrolledText(
-            chat_container,
-            font=(FONT_FAMILY, FONT_SIZE),
-            bg="#0d0d0d", fg=FG_COLOR,
+        # 日志区：从底部往上堆 (side=bottom 逆序)
+        self._log_text = scrolledtext.ScrolledText(
+            self._main_frame,
+            font=(FONT_FAMILY, FONT_SIZE - 1),
+            bg=BG_COLOR, fg=FG_COLOR,
             insertbackground=FG_COLOR,
             wrap=tk.WORD,
             state="disabled",
             relief="flat",
             borderwidth=0,
             highlightthickness=0,
+            height=6,
         )
-        self._chat_text.pack(fill="both", expand=True, padx=4, pady=(0, 0))
+        self._log_text.pack(side="bottom", fill="x", padx=4, pady=(0, 4))
 
-        self._chat_text.tag_config("user", foreground=ACCENT, font=(FONT_FAMILY, FONT_SIZE, "bold"))
-        self._chat_text.tag_config("assistant", foreground=SUCCESS_COLOR)
-        self._chat_text.tag_config("system", foreground=WARN_COLOR)
-        self._chat_text.tag_config("dim", foreground=DIM_COLOR)
+        log_label = tk.Label(
+            self._main_frame, text="  📋 日志", font=(FONT_FAMILY, 9),
+            fg=DIM_COLOR, bg=BG_COLOR, anchor="w",
+        )
+        log_label.pack(side="bottom", fill="x", padx=4, pady=(0, 0))
 
-        # ── 输入区（贴在聊天区底部） ──
-        input_frame = tk.Frame(chat_container, bg=BG_COLOR)
-        input_frame.pack(side="bottom", fill="x", padx=4, pady=(4, 2))
+        log_sep = tk.Frame(self._main_frame, bg="#333333", height=1)
+        log_sep.pack(side="bottom", fill="x", padx=4, pady=(2, 4))
+
+        # 输入区：放在日志上方 (相对于日志是 side=bottom 的下一个)
+        input_frame = tk.Frame(self._main_frame, bg=BG_COLOR)
+        input_frame.pack(side="bottom", fill="x", padx=4, pady=(0, 6))
 
         self._input_var = tk.StringVar()
         self._input_entry = tk.Entry(
@@ -228,29 +235,24 @@ class AgentGUI:
         send_btn.pack(side="right", padx=(6, 0))
         send_btn.bind("<Button-1>", self._on_send)
 
-        # ── 日志区（底部，较小） ──
-        log_sep = tk.Frame(self._main_frame, bg="#333333", height=1)
-        log_sep.pack(fill="x", padx=4, pady=(4, 0))
-
-        log_label = tk.Label(
-            self._main_frame, text="  📋 日志", font=(FONT_FAMILY, 9),
-            fg=DIM_COLOR, bg=BG_COLOR, anchor="w",
-        )
-        log_label.pack(fill="x", padx=4, pady=(2, 0))
-
-        self._log_text = scrolledtext.ScrolledText(
+        # 聊天区：最后 pack (默认 side=top) 填满中间剩余空间
+        self._chat_text = scrolledtext.ScrolledText(
             self._main_frame,
-            font=(FONT_FAMILY, FONT_SIZE - 1),
-            bg=BG_COLOR, fg=FG_COLOR,
+            font=(FONT_FAMILY, FONT_SIZE),
+            bg="#0d0d0d", fg=FG_COLOR,
             insertbackground=FG_COLOR,
             wrap=tk.WORD,
             state="disabled",
             relief="flat",
             borderwidth=0,
             highlightthickness=0,
-            height=6,
         )
-        self._log_text.pack(fill="x", padx=4, pady=(0, 4))
+        self._chat_text.pack(fill="both", expand=True, padx=4, pady=2)
+
+        self._chat_text.tag_config("user", foreground=ACCENT, font=(FONT_FAMILY, FONT_SIZE, "bold"))
+        self._chat_text.tag_config("assistant", foreground=SUCCESS_COLOR)
+        self._chat_text.tag_config("system", foreground=WARN_COLOR)
+        self._chat_text.tag_config("dim", foreground=DIM_COLOR)
 
         self._log_text.tag_config("dim", foreground=DIM_COLOR)
         self._log_text.tag_config("success", foreground=SUCCESS_COLOR)
