@@ -587,7 +587,10 @@ class VideoAgent:
         # ── 停止 ──
         elif text_lower in ("停止", "stop", "停止分析"):
             self.stop_analysis()
+            self.stop_caption()
+            self._gui.log("分析已停止", "accent")
             self._gui.assistant_say("分析已停止。")
+            return
 
         # ── 连接浏览器 ──
         elif text_lower in ("连接浏览器", "connect", "连接"):
@@ -820,6 +823,17 @@ class VideoAgent:
                     if not self._caption_running:
                         self.start_caption(save_dir=self._session_dir)
                     self.start_analysis()
+                    return False
+
+                elif t == "stop":
+                    self.stop_analysis()
+                    self.stop_caption()
+                    self._gui.log("DS 请求停止", "accent")
+                    self._gui.assistant_say("已停止。")
+                    self._chat_history.append({
+                        "role": "system",
+                        "content": "（分析/操作已停止。）"
+                    })
                     return False
 
                 elif t == "seek":

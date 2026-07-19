@@ -341,7 +341,7 @@ class DeepSeekClient:
             r'\{\s*"type"\s*:\s*"(\w+)"[^}]*\}', text
         )
         for atype in action_pattern:
-            if atype in ("seek", "pause", "play", "screenshot", "click", "navigate",
+            if atype in ("seek", "pause", "play", "screenshot", "click", "stop", "navigate",
                          "analyze", "status", "search", "get_page", "new_session"):
                 a = {"type": atype}
                 if atype == "seek":
@@ -400,6 +400,7 @@ CHAT_SYSTEM_PROMPT = """你是 VideoAgent，一个能直接操控浏览器的 AI
 - search(query) — 搜索视频
 - get_page — 需要更详细的页面元素时（链接、按钮等），系统会回传并让你二次决策
 - new_session — 切换视频时新建会话文件夹
+- stop — 停止当前分析/操作（用户说"停止"时输出此动作）
 
 **click 用法示例**：
 - 用户说「打开第十讲」→ 在页面元素中看到「第10讲·通信接口」→ click(text="第10讲·通信接口")
