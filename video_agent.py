@@ -988,7 +988,10 @@ class VideoAgent:
 
             if follow_actions:
                 self._gui.log(f"DS 二次返回 {len(follow_actions)} 个动作: {[a.get('type') for a in follow_actions]}", "dim")
-                self._execute_ds_actions(follow_actions, user_text)
+                changed = self._execute_ds_actions(follow_actions, user_text)
+                if changed:
+                    self._gui.log("二次决策后页面变化，自动续问 DS...", "dim")
+                    self._auto_continue_after_page_change()
 
             return False  # get_page 已内部处理完成
 

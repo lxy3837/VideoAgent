@@ -309,18 +309,24 @@ class DeepSeekClient:
             json_match = re.search(r'\{[\s\S]*"actions"[\s\S]*\}', response)
 
         if json_match:
+            # 剥离 JSON 块，保留纯文本
+            plain_text = (
+                response[:json_match.start()].strip() +
+                "\n" +
+                response[json_match.end():].strip()
+            ).strip()
+
             json_str = json_match.group(1) if json_match.lastindex else json_match.group(0)
             try:
                 parsed = json.loads(json_str)
                 if isinstance(parsed, dict):
-                    result["reply"] = parsed.get("reply", result["reply"])
+                    # JSON 里有 reply → 用它；没有 → 用剥离后的纯文本
+                    result["reply"] = (parsed.get("reply") or plain_text).strip()
                     raw_actions = parsed.get("actions", [])
                     if isinstance(raw_actions, list):
                         result["actions"] = [a for a in raw_actions if isinstance(a, dict)]
-                    # 去掉 JSON 块，只保留纯文本回复
-                    result["reply"] = result["reply"].strip()
             except json.JSONDecodeError:
-                pass
+                result["reply"] = plain_text
 
         return result
 
