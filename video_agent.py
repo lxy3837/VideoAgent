@@ -553,15 +553,17 @@ class VideoAgent:
         text_lower = text.strip().lower()
         text_raw = text.strip()
 
-        # ── 一键启动：帮我分析 ──
+        # ── 启动 Agent / 新会话 ──
         if any(kw in text_raw for kw in ("新会话", "新建会话", "开新的")):
             self._session_dir = ""  # 清空，强制新建
             self._gui.assistant_say("将创建新会话...")
-            self._one_click_analyze()
+            self._start_agent(text_raw)
             return
 
-        if any(kw in text_raw for kw in ("帮我分析", "分析这个视频", "分析视频", "分析一下", "继续分析")):
-            self._one_click_analyze()
+        if any(kw in text_raw for kw in ("帮我分析", "分析这个视频", "分析视频", "分析一下",
+                                          "继续分析", "启动agent", "启动Agent", "启动 agent",
+                                          "开始分析", "start", "go", "开始")):
+            self._start_agent(text_raw)
             return
 
         # ── 扫描播放器 ──
@@ -584,22 +586,6 @@ class VideoAgent:
             self._gui.assistant_say("格式: 设置密钥 sk-xxxxxxxx")
             return
 
-        # ── 启动分析 ──
-        if text_lower in ("开始分析", "start", "分析", "go"):
-            if not self._browser.connected:
-                self._gui.assistant_say("请先连接浏览器。输入「帮我分析」自动处理。")
-                return
-            if not self._browser.has_video_page:
-                self._gui.assistant_say("浏览器已连接，但未检测到视频。请在 Edge 中打开视频页面，然后输入「开始分析」。")
-                # 再尝试找一次
-                self._find_video_page()
-                if not self._browser.has_video_page:
-                    return
-            if not self._caption_running:
-                self._gui.assistant_say("字幕录制尚未开始。正在启动...")
-                self.start_caption()
-            self.start_analysis()
-
         # ── 停止 ──
         elif text_lower in ("停止", "stop", "停止分析"):
             self.stop_analysis()
@@ -608,11 +594,11 @@ class VideoAgent:
         # ── 连接浏览器 ──
         elif text_lower in ("连接浏览器", "connect", "连接"):
             if self._browser.connected:
-                self._gui.assistant_say("浏览器已连接。输入「帮我分析」开始自动分析。")
+                self._gui.assistant_say("浏览器已连接。输入「启动 Agent」或任何指令即可。")
             else:
                 ok = self.connect_browser(auto_start=False)
                 if ok:
-                    self._gui.assistant_say("浏览器连接成功！输入「帮我分析」开始分析。")
+                    self._gui.assistant_say("浏览器连接成功！输入「启动 Agent」开始。")
 
         # ── 启动 Edge 调试模式 ──
         elif text_lower in ("启动 edge", "启动edge", "edge 调试", "打开 edge", "自动启动 edge"):
@@ -620,8 +606,8 @@ class VideoAgent:
             ok = self.connect_browser(auto_start=True)
             if ok:
                 self._gui.assistant_say(
-                    "Edge 已启动！请在 Edge 中打开你要分析的视频，\n"
-                    "然后输入「帮我分析」开始。"
+                    "Edge 已启动！请在 Edge 中打开你要看的页面，\n"
+                    "然后输入「启动 Agent」开始。"
                 )
             else:
                 self._gui.assistant_say(
@@ -651,16 +637,17 @@ class VideoAgent:
         elif text_lower in ("帮助", "help", "?"):
             self._gui.assistant_say(
                 "可用指令：\n"
-                "  • 帮我分析这个视频 — 一键启动\n"
+                "  • 启动 Agent / 帮我分析 — 启动 AI 助手（自动判断当前页面做什么）\n"
+                "  • 帮我找 xxx — 搜索视频并导航\n"
                 "  • 连接浏览器 — 连到已开启 CDP 的 Edge\n"
                 "  • 启动 Edge — 自动开启 Edge 调试模式\n"
-                "  • 开始分析 — 仅启动分析\n"
                 "  • 停止 — 停止分析\n"
                 "  • 截图 — 手动截图当前帧\n"
                 "  • 状态 — 查看当前状态\n"
+                "  • 新会话 — 强制新建分析文件夹\n"
                 "  • 设置密钥 sk-xxx — 配置 API Key\n"
                 "\n"
-                "也可以直接输入自然语言指令，如「帮我找CNN教程」「跳到10分钟」「总结一下」"
+                "也可以直接输入自然语言指令，Agent 会智能理解你的意图。"
             )
 
         # ── 通用 DS 聊天（所有未匹配的指令都发给 DeepSeek）──
@@ -751,7 +738,10 @@ class VideoAgent:
                     self._stop_requested = True
                     self._analyzing = False
                     self._gui.assistant_say("正在创建新会话...")
-                    self._one_click_analyze()
+                    self._setup_session_folder()
+                    if not self._caption_running:
+                        self.start_caption(save_dir=self._session_dir)
+                    self.start_analysis()
                     return
 
                 elif t == "seek":
@@ -788,7 +778,12 @@ class VideoAgent:
                         self._gui.assistant_say(f"已搜索: {query}")
 
                 elif t == "analyze":
-                    self._one_click_analyze()
+                    # DS 已决策要分析 → 直接设置会话并启动
+                    if not self._session_dir:
+                        self._setup_session_folder()
+                    if not self._caption_running:
+                        self.start_caption(save_dir=self._session_dir)
+                    self.start_analysis()
                     return  # analyze 是完整流程，后面的动作没必要了
 
                 elif t == "status":
@@ -930,13 +925,16 @@ URL: {page_url}
             pass
         return ""
 
-    # ── 一键分析 ──
+    # ── 启动 Agent（智能决策入口）──
 
-    def _one_click_analyze(self):
-        """一键启动完整流程：连接浏览器 → 启动字幕 → 开始分析。
+    def _start_agent(self, user_text: str = ""):
+        """启动 Agent：连接浏览器 → 收集页面上下文 → 交给 DS 智能决策下一步。
 
-        如果已有活跃会话，自动续接（不新建文件夹）。
-        输入「新会话」强制开新的。
+        不再硬编码「一定是视频分析」。DS 会看当前页面是什么：
+        - 视频页 → 启动分析
+        - 搜索结果页 → 帮你选视频
+        - 课程列表页 → 帮你找教程
+        - 空白页 → 问你要干什么
         """
         if not self._deepseek.configured:
             self._gui.assistant_say(
@@ -945,24 +943,11 @@ URL: {page_url}
             )
             return
 
-        # 已在分析中 → 直接返回
-        if self._analyzing:
-            self._gui.assistant_say("分析已在运行中，无需重复启动。输入「停止」可终止。")
-            return
+        self._gui.log("启动 Agent...", "accent")
 
-        # 已有会话且字幕在运行 → 续接，不新建文件夹
-        if self._session_dir and self._caption_running:
-            self._gui.log(f"续接会话: {os.path.basename(self._session_dir)}/", "accent")
-            self._gui.assistant_say("检测到已有活跃会话，继续分析...")
-            self.start_analysis()
-            return
-
-        self._gui.assistant_say("收到！正在启动分析流程...")
-        self._gui.log("「帮我分析」一键启动", "accent")
-
-        # Step 1: 确保浏览器可用
+        # Step 1: 确保浏览器连接
         if not self._browser.connected:
-            self._gui.assistant_say("第一步：连接浏览器...")
+            self._gui.assistant_say("正在连接浏览器...")
             ok = self.connect_browser(auto_start=True)
             if not ok:
                 self._gui.assistant_say(
@@ -971,39 +956,102 @@ URL: {page_url}
                 return
             self._gui.assistant_say("浏览器已连接 ✓")
 
-        # Step 1.5: 检查是否有视频页面
-        if not self._browser.has_video_page:
-            # 尝试智能扫描——可能不是标准 <video> 标签
-            self._gui.log("标准检测未找到视频，尝试智能扫描...", "accent")
-            scan = self._run_async(self._browser.scan_page_for_media(), timeout=10)
-            if isinstance(scan, dict) and scan.get("custom_players"):
-                cp = scan["custom_players"]
-                self._gui.log(f"发现 {len(cp)} 个自定义播放器: {[p['selector'] for p in cp]}", "dim")
-                # 自动选择第一个内置 video 的播放器
-                for p in cp:
-                    if p.get("hasVideoInside"):
-                        sel = f"{p['selector']} video"
-                        self._browser.set_video_selector(sel)
-                        self._gui.log(f"自动选择视频选择器: {sel}", "success")
-                        self._gui.assistant_say(f"✓ 已智能识别视频播放器 ({p['selector']})")
-                        # 重新确认有视频页
-                        self._find_video_page()
-                        break
-                if not self._browser.has_video_page:
-                    self._gui.assistant_say(
-                        "检测到播放器但内部无标准 video 标签。\n"
-                        "建议对 AI 说「扫描播放器」获取详细信息。"
-                    )
-                    return
-            else:
-                self._gui.assistant_say(
-                    "浏览器已连接，但未检测到视频标签页。\n"
-                    "请在 Edge 中打开要分析的视频页面，然后输入「开始分析」。"
-                )
-                self._gui.log("未检测到视频标签页，请在 Edge 中打开视频后输入「开始分析」", "warn")
-                return
+        # Step 2: 收集页面上下文
+        page_title = ""
+        page_url = ""
+        has_video = self._browser.has_video_page
+        video_state = None
 
-        # Step 1: 创建会话文件夹（用视频标题命名）
+        try:
+            state = self._run_async(self._browser.get_state(), timeout=5)
+            if state:
+                page_title = state.get("page_title", "")
+                page_url = state.get("page_url", "")
+                video_state = {
+                    "video_time": state.get("current_time", 0),
+                    "duration": state.get("duration", 0),
+                    "paused": state.get("paused", False),
+                    "page_title": page_title,
+                }
+                has_video = state.get("has_video", has_video)
+        except Exception:
+            pass
+
+        # 若标准检测没找到视频，尝试智能扫描
+        if not has_video:
+            try:
+                scan = self._run_async(self._browser.scan_page_for_media(), timeout=10)
+                if isinstance(scan, dict) and scan.get("custom_players"):
+                    cp = scan["custom_players"]
+                    self._gui.log(f"智能扫描发现 {len(cp)} 个自定义播放器", "dim")
+                    for p in cp:
+                        if p.get("hasVideoInside"):
+                            sel = f"{p['selector']} video"
+                            self._browser.set_video_selector(sel)
+                            self._find_video_page()
+                            has_video = self._browser.has_video_page
+                            video_state = {
+                                "video_time": 0, "duration": 0,
+                                "paused": False, "page_title": page_title,
+                            }
+                            break
+            except Exception:
+                pass
+
+        # Step 3: 构建上下文描述，发给 DS 决策
+        context_desc = f"Agent 已就绪。\n"
+        context_desc += f"- 页面标题: {page_title or '未知'}\n"
+        context_desc += f"- 页面 URL: {page_url or '未知'}\n"
+        context_desc += f"- 检测到视频: {'是' if has_video else '否'}\n"
+        if has_video and video_state:
+            context_desc += f"- 视频进度: {video_state.get('video_time',0):.0f}s / {video_state.get('duration',0):.0f}s\n"
+            context_desc += f"- 播放状态: {'已暂停' if video_state.get('paused') else '播放中'}\n"
+
+        if user_text:
+            context_desc += f"\n用户说: 「{user_text}」\n"
+        context_desc += "\n请判断当前上下文，决定下一步做什么。如果需要操作浏览器，请附带 JSON 动作块。"
+
+        self._gui.log(f"Agent 上下文 → DS: {page_title[:30]} | 视频={'有' if has_video else '无'}", "dim")
+        self._gui.assistant_say("Agent 已启动，正在分析当前页面...")
+
+        # Step 4: 发送给 DS，执行决策
+        try:
+            result = self._deepseek.chat(
+                user_message=context_desc,
+                video_state=video_state,
+                conversation_history=self._chat_history,
+            )
+        except Exception as e:
+            self._gui.assistant_say(f"Agent 决策失败: {e}")
+            self._gui.log(f"DS 调用失败: {e}", "error")
+            return
+
+        reply = result.get("reply", "")
+        actions = result.get("actions", [])
+
+        if reply:
+            self._gui.assistant_say(reply)
+        self._chat_history.append({"role": "user", "content": context_desc})
+        self._chat_history.append({"role": "assistant", "content": reply})
+
+        if len(self._chat_history) > 40:
+            self._chat_history = self._chat_history[-40:]
+
+        # Step 5: 执行 DS 的决策
+        if actions:
+            self._gui.log(f"Agent 决策: {[a.get('type') for a in actions]}", "accent")
+            self._execute_ds_actions(actions, user_text)
+        else:
+            self._gui.log("Agent 无需执行操作（纯对话回复）", "dim")
+
+    # ── 会话文件夹 ──
+
+    def _setup_session_folder(self):
+        """创建会话文件夹（按视频标题+时间戳命名）。如果已有会话则复用。"""
+        if self._session_dir and os.path.isdir(self._session_dir):
+            self._gui.log(f"复用会话: {os.path.basename(self._session_dir)}/", "dim")
+            return
+
         safe_title = self._get_safe_video_title()
         session_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         folder_name = f"{session_ts}_{safe_title}" if safe_title else session_ts
@@ -1014,17 +1062,7 @@ URL: {page_url}
         os.makedirs(self._screenshot_dir, exist_ok=True)
         self._gui.log(f"会话文件夹: sessions/{folder_name}/", "accent")
 
-        # Step 2: 启动字幕（写入会话文件夹）
-        if not self._caption_running:
-            self._gui.assistant_say("第二步：启动字幕录制...")
-            ok = self.start_caption(save_dir=self._session_dir)
-            if not ok:
-                self._gui.assistant_say("❌ 字幕启动失败，请检查依赖。")
-                return
-
-        # Step 3: 开始分析
-        self._gui.assistant_say("第三步：开始自动分析！")
-        self.start_analysis()
+    # ── 手动截图 ──
 
     def _manual_screenshot(self):
         if not self._browser.has_video_page:
