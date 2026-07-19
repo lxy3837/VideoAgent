@@ -553,18 +553,16 @@ class VideoAgent:
         text_lower = text.strip().lower()
         text_raw = text.strip()
 
-        # ── 启动 Agent / 新会话 ──
-        if any(kw in text_raw for kw in ("新会话", "新建会话", "开新的")):
-            self._session_dir = ""  # 清空，强制新建
-            self._gui.assistant_say("将创建新会话...")
-            self._start_agent(text_raw)
+        # ── 启动 Agent（仅连接浏览器） ──
+        if any(kw in text_raw for kw in ("启动agent", "启动Agent", "启动 agent",
+                                          "启动 Agent", "连接浏览器")):
+            threading.Thread(target=self._start_agent, daemon=True).start()
             return
 
-        if any(kw in text_raw for kw in ("帮我分析", "分析这个视频", "分析视频", "分析一下",
-                                          "继续分析", "启动agent", "启动Agent", "启动 agent",
-                                          "开始分析", "start", "go", "开始")):
-            self._start_agent(text_raw)
-            return
+        # ── 新会话（清空旧文件夹，后续走 DS 决策） ──
+        if any(kw in text_raw for kw in ("新会话", "新建会话", "开新的")):
+            self._session_dir = ""
+            self._gui.assistant_say("已清空会话上下文。")
 
         # ── 扫描播放器 ──
         if any(kw in text_raw for kw in ("扫描播放器", "扫描视频", "检测播放器", "识别视频")):
@@ -662,20 +660,37 @@ class VideoAgent:
 
         self._gui.log(f"DS 聊天: {text[:50]}", "accent")
 
-        # 收集当前状态
-        video_state = None
-        try:
-            if self._browser.has_video_page:
-                state = self._run_async(self._browser.get_state())
+        # 始终收集页面上下文（标题、URL、是否有视频），不只是 video_state
+        page_context = {
+            "page_title": "",
+            "page_url": "",
+            "has_video": False,
+            "video_time": 0.0,
+            "duration": 0.0,
+            "paused": False,
+        }
+        if self._browser.connected:
+            try:
+                state = self._run_async(self._browser.get_state(), timeout=5)
                 if state:
-                    video_state = {
-                        "video_time": state.get("current_time", 0),
-                        "duration": state.get("duration", 0),
-                        "paused": state.get("paused", False),
-                        "page_title": state.get("page_title", ""),
-                    }
-        except Exception:
-            pass
+                    page_context["page_title"] = state.get("page_title", "")
+                    page_context["page_url"] = state.get("page_url", "")
+                    page_context["has_video"] = state.get("has_video", False)
+                    page_context["video_time"] = state.get("current_time", 0)
+                    page_context["duration"] = state.get("duration", 0)
+                    page_context["paused"] = state.get("paused", False)
+            except Exception:
+                pass
+
+        # 构建给 DS 的 video_state（兼容现有 chat 接口）
+        video_state = {
+            "video_time": page_context["video_time"],
+            "duration": page_context["duration"],
+            "paused": page_context["paused"],
+            "page_title": page_context["page_title"],
+            "page_url": page_context["page_url"],
+            "has_video": page_context["has_video"],
+        } if self._browser.connected else None
 
         try:
             result = self._deepseek.chat(
@@ -925,27 +940,15 @@ URL: {page_url}
             pass
         return ""
 
-    # ── 启动 Agent（智能决策入口）──
+    # ── 启动 Agent（只连浏览器，不做任何决策）──
 
-    def _start_agent(self, user_text: str = ""):
-        """启动 Agent：连接浏览器 → 收集页面上下文 → 交给 DS 智能决策下一步。
+    def _start_agent(self):
+        """启动 Agent：只连接浏览器 + 锁定用户可见标签页。不分析、不决策。
 
-        不再硬编码「一定是视频分析」。DS 会看当前页面是什么：
-        - 视频页 → 启动分析
-        - 搜索结果页 → 帮你选视频
-        - 课程列表页 → 帮你找教程
-        - 空白页 → 问你要干什么
+        后续用户说「帮我分析」「帮我找视频」时，由 _handle_ds_chat 带页面上下文交给 DS 决策。
         """
-        if not self._deepseek.configured:
-            self._gui.assistant_say(
-                "⚠ 尚未配置 DeepSeek API Key。\n"
-                "请在「配置」面板（标题栏 ⚙）中设置，或输入「设置密钥 sk-xxx」"
-            )
-            return
-
         self._gui.log("启动 Agent...", "accent")
 
-        # Step 1: 确保浏览器连接
         if not self._browser.connected:
             self._gui.assistant_say("正在连接浏览器...")
             ok = self.connect_browser(auto_start=True)
@@ -953,100 +956,14 @@ URL: {page_url}
                 self._gui.assistant_say(
                     "浏览器启动失败。请确认 Edge 已安装且任务管理器中没有残留的 msedge 进程。"
                 )
-                return
+                return False
             self._gui.assistant_say("浏览器已连接 ✓")
 
-        # Step 1.5: 确保当前 page 指向用户正在看的标签页（不碰其他窗口）
+        # 锁定用户正在看的标签页
         self._run_async(self._browser.ensure_active_tab())
         self._gui.log("已锁定用户可见标签页", "dim")
-
-        # Step 2: 收集页面上下文
-        page_title = ""
-        page_url = ""
-        has_video = self._browser.has_video_page
-        video_state = None
-
-        try:
-            state = self._run_async(self._browser.get_state(), timeout=5)
-            if state:
-                page_title = state.get("page_title", "")
-                page_url = state.get("page_url", "")
-                video_state = {
-                    "video_time": state.get("current_time", 0),
-                    "duration": state.get("duration", 0),
-                    "paused": state.get("paused", False),
-                    "page_title": page_title,
-                }
-                has_video = state.get("has_video", has_video)
-        except Exception:
-            pass
-
-        # 若标准检测没找到视频，尝试智能扫描
-        if not has_video:
-            try:
-                scan = self._run_async(self._browser.scan_page_for_media(), timeout=10)
-                if isinstance(scan, dict) and scan.get("custom_players"):
-                    cp = scan["custom_players"]
-                    self._gui.log(f"智能扫描发现 {len(cp)} 个自定义播放器", "dim")
-                    for p in cp:
-                        if p.get("hasVideoInside"):
-                            sel = f"{p['selector']} video"
-                            self._browser.set_video_selector(sel)
-                            self._find_video_page()
-                            has_video = self._browser.has_video_page
-                            video_state = {
-                                "video_time": 0, "duration": 0,
-                                "paused": False, "page_title": page_title,
-                            }
-                            break
-            except Exception:
-                pass
-
-        # Step 3: 构建上下文描述，发给 DS 决策
-        context_desc = f"Agent 已就绪。\n"
-        context_desc += f"- 页面标题: {page_title or '未知'}\n"
-        context_desc += f"- 页面 URL: {page_url or '未知'}\n"
-        context_desc += f"- 检测到视频: {'是' if has_video else '否'}\n"
-        if has_video and video_state:
-            context_desc += f"- 视频进度: {video_state.get('video_time',0):.0f}s / {video_state.get('duration',0):.0f}s\n"
-            context_desc += f"- 播放状态: {'已暂停' if video_state.get('paused') else '播放中'}\n"
-
-        if user_text:
-            context_desc += f"\n用户说: 「{user_text}」\n"
-        context_desc += "\n请判断当前上下文，决定下一步做什么。如果需要操作浏览器，请附带 JSON 动作块。"
-
-        self._gui.log(f"Agent 上下文 → DS: {page_title[:30]} | 视频={'有' if has_video else '无'}", "dim")
-        self._gui.assistant_say("Agent 已启动，正在分析当前页面...")
-
-        # Step 4: 发送给 DS，执行决策
-        try:
-            result = self._deepseek.chat(
-                user_message=context_desc,
-                video_state=video_state,
-                conversation_history=self._chat_history,
-            )
-        except Exception as e:
-            self._gui.assistant_say(f"Agent 决策失败: {e}")
-            self._gui.log(f"DS 调用失败: {e}", "error")
-            return
-
-        reply = result.get("reply", "")
-        actions = result.get("actions", [])
-
-        if reply:
-            self._gui.assistant_say(reply)
-        self._chat_history.append({"role": "user", "content": context_desc})
-        self._chat_history.append({"role": "assistant", "content": reply})
-
-        if len(self._chat_history) > 40:
-            self._chat_history = self._chat_history[-40:]
-
-        # Step 5: 执行 DS 的决策
-        if actions:
-            self._gui.log(f"Agent 决策: {[a.get('type') for a in actions]}", "accent")
-            self._execute_ds_actions(actions, user_text)
-        else:
-            self._gui.log("Agent 无需执行操作（纯对话回复）", "dim")
+        self._gui.assistant_say("Agent 已就绪！可以跟我说「帮我分析」「帮我找视频」或任何你想做的事。")
+        return True
 
     # ── 会话文件夹 ──
 

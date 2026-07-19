@@ -269,15 +269,18 @@ class DeepSeekClient:
         # 构建系统提示
         state_desc = ""
         if video_state:
+            pl = video_state.get("page_title", "未知")
+            pu = video_state.get("page_url", "")
+            hv = video_state.get("has_video", False)
             t = video_state.get("video_time", 0)
             d = video_state.get("duration", 0)
-            p = "已暂停" if video_state.get("paused") else "播放中"
-            pl = video_state.get("page_title", "未知")
+            p = "已暂停" if video_state.get("paused") else "播放中" if hv else "无视频"
             state_desc = (
-                f"\n**当前状态**：\n"
-                f"- 视频: {pl}\n"
-                f"- 进度: {t:.0f}s / {d:.0f}s\n"
-                f"- 状态: {p}\n"
+                f"\n**当前页面**：\n"
+                f"- 标题: {pl}\n"
+                f"- URL: {pu}\n"
+                f"- 视频: {'有' if hv else '无'}\n"
+                f"- 进度: {t:.0f}s / {d:.0f}s  |  {p}\n"
             )
 
         system_prompt = CHAT_SYSTEM_PROMPT + state_desc
