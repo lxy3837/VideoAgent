@@ -692,9 +692,37 @@ class VideoAgent:
             "has_video": page_context["has_video"],
         } if self._browser.connected else None
 
+        # 非视频页自动附上页面结构，让 DS 能「看到」当前页面有什么
+        user_text = text
+        if self._browser.connected and not page_context.get("has_video"):
+            try:
+                structure = self._run_async(self._browser.get_page_ax_tree(), timeout=5)
+                elements = structure.get("elements", [])
+                if elements:
+                    links = [e for e in elements if e["type"] in ("link", "menuitem", "tab")]
+                    buttons = [e for e in elements if e["type"] == "button"]
+                    headings = [e for e in elements if e["type"] == "heading"]
+                    search_boxes = [e for e in elements if e["type"] == "search_box"]
+
+                    parts = ["\n---\n当前页面可见内容："]
+                    if headings:
+                        parts.append("[页面标题] " + " > ".join(h["text"][:40] for h in headings[:5]))
+                    if links:
+                        parts.append("[链接] " + " | ".join(
+                            f"{l['text'][:30]}" + (f"→{l.get('href','')[:60]}" if l.get('href') else "")
+                            for l in links[:15]
+                        ))
+                    if buttons:
+                        parts.append("[按钮] " + ", ".join(b["text"][:25] for b in buttons[:8]))
+                    if search_boxes:
+                        parts.append("[搜索框] " + ", ".join(s["text"][:25] for s in search_boxes[:3]))
+                    user_text = text + "\n".join(parts)
+            except Exception:
+                pass  # 获取失败不阻塞正常聊天
+
         try:
             result = self._deepseek.chat(
-                user_message=text,
+                user_message=user_text,
                 video_state=video_state,
                 conversation_history=self._chat_history,
             )
