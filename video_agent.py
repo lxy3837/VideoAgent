@@ -809,69 +809,71 @@ class VideoAgent:
 
         # ── get_page 二次决策：拿到页面结构 → 回传给 DS 分析跳转入口 ──
         if needs_page_roundtrip:
-            self._gui.log("DS 请求页面结构，正在提取...", "accent")
+            self._gui.log("DS 请求页面结构，正在提取（AX Tree 优先）...", "accent")
             try:
+                # 优先用 AX tree（更通用，不依赖 CSS 选择器）
+                page_data = self._run_async(self._browser.get_page_ax_tree(), timeout=10)
+                if not page_data.get("elements"):
+                    # AX tree 为空 → 回退到 DOM 扫描
+                    self._gui.log("AX tree 为空，回退到 DOM 扫描...", "dim")
+                    page_data = self._run_async(self._browser.get_page_structure())
+            except Exception:
+                # AX tree 失败 → 回退
+                self._gui.log("AX tree 提取失败，回退到 DOM 扫描...", "dim")
                 page_data = self._run_async(self._browser.get_page_structure())
-                elements = page_data.get("elements", [])
-                page_title = page_data.get("title", "")
-                page_url = page_data.get("url", "")
 
-                # 构建结构化摘要给 DS
-                nav_links = [e for e in elements if e["type"] == "nav_link"]
-                buttons = [e for e in elements if e["type"] == "button"]
-                video_items = [e for e in elements if e["type"] == "video_related"]
-                content_links = [e for e in elements if e["type"] == "content_link"]
-                search_boxes = [e for e in elements if e["type"] == "search_box"]
+            elements = page_data.get("elements", [])
+            page_title = page_data.get("title", "")
+            page_url = page_data.get("url", "")
+            page_source = page_data.get("source", "dom")
 
-                page_summary = f"""当前页面: {page_title}
-URL: {page_url}
+            # 构建结构化摘要给 DS（兼容 AX tree 和 DOM 两种格式）
+            links = [e for e in elements if e["type"] in ("link", "nav_link", "video_related", "content_link")]
+            buttons = [e for e in elements if e["type"] == "button"]
+            headings = [e for e in elements if e["type"] == "heading"]
+            search_boxes = [e for e in elements if e["type"] == "search_box"]
 
-可见交互元素共 {len(elements)} 个:
+            page_summary_parts = [f"当前页面: {page_title}", f"URL: {page_url}"]
+            page_summary_parts.append(f"\n可见交互元素共 {len(elements)} 个 (来源: {page_source}):\n")
+            if links:
+                page_summary_parts.append(f"【链接】({len(links)}个):")
+                page_summary_parts.append(self._fmt_page_items(links[:20]))
+            if buttons:
+                page_summary_parts.append(f"\n【按钮】({len(buttons)}个):")
+                page_summary_parts.append(self._fmt_page_items(buttons[:15]))
+            if headings:
+                page_summary_parts.append(f"\n【标题/章节】({len(headings)}个):")
+                page_summary_parts.append(self._fmt_page_items(headings[:10]))
+            if search_boxes:
+                page_summary_parts.append(f"\n【搜索框】({len(search_boxes)}个):")
+                page_summary_parts.append(self._fmt_page_items(search_boxes[:5]))
+            page_summary = "\n".join(page_summary_parts)
 
-【导航链接】({len(nav_links)}个):
-{self._fmt_page_items(nav_links[:20])}
+            self._gui.log(f"页面结构: {len(elements)} 个元素 (AX={page_source}) -> 回传 DS 分析", "dim")
 
-【视频推荐/播放列表】({len(video_items)}个):
-{self._fmt_page_items(video_items[:15])}
+            # 回传 DS 做二次决策
+            follow_msg = f"请分析以下页面结构，用户原话「{user_text}」。找到最匹配的链接并导航：\n\n{page_summary}"
+            self._chat_history.append({"role": "user", "content": follow_msg})
 
-【主要内容链接】({len(content_links)}个):
-{self._fmt_page_items(content_links[:15])}
-
-【按钮】({len(buttons)}个):
-{self._fmt_page_items(buttons[:10])}
-
-【搜索框】({len(search_boxes)}个):
-{self._fmt_page_items(search_boxes[:5])}"""
-
-                self._gui.log(f"页面结构: {len(elements)} 个元素 -> 回传 DS 分析", "dim")
-
-                # 回传 DS 做二次决策
-                follow_msg = f"请分析以下页面结构，用户原话「{user_text}」。找到最匹配的链接并导航：\n\n{page_summary}"
-                self._chat_history.append({"role": "user", "content": follow_msg})
-
-                try:
-                    result = self._deepseek.chat(
-                        user_message=follow_msg,
-                        conversation_history=self._chat_history,
-                    )
-                except Exception as e:
-                    self._gui.assistant_say(f"DS 二次调用失败: {e}")
-                    return
-
-                reply = result.get("reply", "")
-                follow_actions = result.get("actions", [])
-
-                if reply:
-                    self._gui.assistant_say(reply)
-                self._chat_history.append({"role": "assistant", "content": reply})
-
-                if follow_actions:
-                    self._gui.log(f"DS 二次返回 {len(follow_actions)} 个动作: {[a.get('type') for a in follow_actions]}", "dim")
-                    self._execute_ds_actions(follow_actions, user_text)
-
+            try:
+                result = self._deepseek.chat(
+                    user_message=follow_msg,
+                    conversation_history=self._chat_history,
+                )
             except Exception as e:
-                self._gui.assistant_say(f"获取页面结构失败: {e}")
-                self._gui.log(f"get_page 失败: {e}", "warn")
+                self._gui.assistant_say(f"DS 二次调用失败: {e}")
+                return
+
+            reply = result.get("reply", "")
+            follow_actions = result.get("actions", [])
+
+            if reply:
+                self._gui.assistant_say(reply)
+            self._chat_history.append({"role": "assistant", "content": reply})
+
+            if follow_actions:
+                self._gui.log(f"DS 二次返回 {len(follow_actions)} 个动作: {[a.get('type') for a in follow_actions]}", "dim")
+                self._execute_ds_actions(follow_actions, user_text)
 
     def _fmt_page_items(self, items: list[dict], max_items: int = 20) -> str:
         """格式化页面元素为 DS 易读的列表。"""

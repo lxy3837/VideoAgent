@@ -1332,3 +1332,77 @@ class BrowserController:
                 print(f"[Browser] 页面元素为空（SPA 可能未渲染），第 {attempt+1} 次重试...")
                 await asyncio.sleep(2)
         return result
+
+    async def get_page_ax_tree(self, max_items: int = 80) -> dict:
+        """用 Playwright accessibility snapshot（底层 CDP Accessibility.snapshotAX）
+        提取页面交互元素。比 JS DOM 查询更通用、更高效，不依赖 CSS 选择器。
+
+        返回格式与 get_page_structure() 兼容，DS 可以无缝切换。
+        """
+        await self.ensure_active_tab()
+        if not self._page:
+            return {"error": "未连接到任何页面", "elements": []}
+
+        ax_root = await self._page.accessibility.snapshot()
+        if not ax_root:
+            return {"title": "", "url": "", "elements": []}
+
+        # 收集页面基本信息
+        title = ""
+        url = ""
+        try:
+            title = await self._page.title()
+            url = self._page.url
+        except Exception:
+            pass
+
+        # 递归展平 AX 树，只取交互元素
+        elements: list[dict] = []
+        seen_texts: set[str] = set()
+
+        def _flatten(node: dict, depth: int = 0):
+            if depth > 20:  # 防止无限递归
+                return
+            role = (node.get("role") or "").lower()
+            name = (node.get("name") or "").strip()
+            value = node.get("value", "")
+
+            # 只收集有意义的交互元素
+            if role in ("link", "button", "menuitem", "tab", "listitem", "option"):
+                if name and name not in seen_texts:
+                    seen_texts.add(name)
+                    elem = {"type": role, "text": name[:60]}
+                    if role == "link" and value:
+                        elem["href"] = str(value)
+                    elements.append(elem)
+
+            elif role in ("textbox", "searchbox", "combobox"):
+                ph = (node.get("placeholder") or name or "").strip()
+                if ph and ph not in seen_texts:
+                    seen_texts.add(ph)
+                    elements.append({"type": "search_box", "text": ph[:60]})
+
+            elif role == "heading" and name:
+                if name not in seen_texts:
+                    seen_texts.add(name)
+                    elements.append({"type": "heading", "text": name[:60]})
+
+            # 递归子节点
+            for child in node.get("children", []) or []:
+                if len(elements) < max_items * 2:  # 放宽收集上限，后续再排序裁剪
+                    _flatten(child, depth + 1)
+
+        _flatten(ax_root)
+
+        # 去重 + 排序（优先 link/button，其次其他）+ 限制总数
+        priority_order = {"link": 0, "button": 1, "search_box": 2, "heading": 3,
+                          "menuitem": 4, "tab": 5, "listitem": 6, "option": 7}
+        result = sorted(elements, key=lambda e: priority_order.get(e["type"], 8))
+        result = result[:max_items]
+
+        return {
+            "title": title,
+            "url": url,
+            "elements": result,
+            "source": "ax_tree",  # 标记数据来源
+        }
