@@ -775,21 +775,31 @@ class VideoAgent:
         # 执行动作
         if actions:
             self._gui.log(f"DS 返回 {len(actions)} 个动作: {[a.get('type') for a in actions]}", "dim")
-            self._execute_ds_actions(actions, text)
+            state_changed = self._execute_ds_actions(actions, text)
 
-    def _execute_ds_actions(self, actions: list[dict], user_text: str = ""):
+            if state_changed and self._browser.connected:
+                # 页面变化后自动续问 DS 一轮，让它看新页面并回复用户
+                self._gui.log("页面已变化，自动续问 DS...", "dim")
+                self._auto_continue_after_page_change()
+
+    def _execute_ds_actions(self, actions: list[dict], user_text: str = "") -> bool:
         """执行 DeepSeek 返回的动作指令。
 
         get_page 动作会触发二次 DS 调用：拿到页面结构后回传给 DS 分析跳转入口。
+
+        Returns:
+            True:  页面状态已改变（navigate/search → 调用方应续问 DS 一轮）
+            False: 页面未变或已内部处理完毕
         """
         if not self._browser.connected or not self._browser.has_video_page:
             for a in actions:
                 t = a.get("type", "")
                 if t in ("analyze", "seek", "pause", "play", "screenshot"):
                     self._gui.assistant_say("请先连接浏览器。输入「帮我分析」自动处理。")
-                    return
+                    return False
 
         needs_page_roundtrip = False
+        state_changed = False
 
         for act in actions:
             t = act.get("type", "")
@@ -810,7 +820,7 @@ class VideoAgent:
                     if not self._caption_running:
                         self.start_caption(save_dir=self._session_dir)
                     self.start_analysis()
-                    return
+                    return False
 
                 elif t == "seek":
                     target = float(act.get("time", 0))
@@ -834,6 +844,7 @@ class VideoAgent:
                     url = act.get("url", "")
                     if url:
                         self._gui.log(f"  导航: {url}", "dim")
+                        state_changed = True
                         self._run_async(self._browser.navigate(url))
                         self._gui.assistant_say(f"已打开 {url}")
                         # 标记到历史，下次 DS 知道已导航过此地
@@ -847,6 +858,7 @@ class VideoAgent:
                     if query:
                         search_url = f"https://www.bilibili.com/search?keyword={query}"
                         self._gui.log(f"  搜索: {query}", "dim")
+                        state_changed = True
                         self._run_async(self._browser.navigate(search_url))
                         self._gui.assistant_say(f"已搜索: {query}")
                         self._chat_history.append({
@@ -861,7 +873,7 @@ class VideoAgent:
                     if not self._caption_running:
                         self.start_caption(save_dir=self._session_dir)
                     self.start_analysis()
-                    return  # analyze 是完整流程，后面的动作没必要了
+                    return False  # analyze 是完整流程，后面的动作没必要了
 
                 elif t == "status":
                     self._show_status()
@@ -924,7 +936,7 @@ class VideoAgent:
                 )
             except Exception as e:
                 self._gui.assistant_say(f"DS 二次调用失败: {e}")
-                return
+                return False
 
             reply = result.get("reply", "")
             follow_actions = result.get("actions", [])
@@ -936,6 +948,87 @@ class VideoAgent:
             if follow_actions:
                 self._gui.log(f"DS 二次返回 {len(follow_actions)} 个动作: {[a.get('type') for a in follow_actions]}", "dim")
                 self._execute_ds_actions(follow_actions, user_text)
+
+            return False  # get_page 已内部处理完成
+
+        return state_changed  # navigate/search → 调用方续问 DS
+
+    # ── 自动续问：navigate/search 后自动让 DS 看新页面 ──
+
+    def _auto_continue_after_page_change(self):
+        """navigate/search 执行后，自动获取新页面上下文 + 问 DS 一轮。
+
+        解决「AI navigate 完后就没下文了」的问题——页面变了，
+        DS 应该继续看新页面、回复用户、或发出下一步动作。
+        最多执行 1 次续问，防止无限循环。
+        """
+        # 收集新页面上下文（复用 _handle_ds_chat 的逻辑）
+        structures = []
+        try:
+            state = self._run_async(self._browser.get_state(), timeout=5)
+            if state:
+                if state.get("page_title"):
+                    structures.append(f"[页面] {state['page_title'][:60]}")
+                if state.get("page_url"):
+                    structures.append(f"[URL] {state['page_url'][:80]}")
+        except Exception:
+            pass
+
+        # 非视频页 → 附页面元素
+        if not (state and state.get("has_video")):
+            try:
+                elements = []
+                ax = self._run_async(self._browser.get_page_ax_tree(), timeout=5)
+                elements = ax.get("elements", [])
+                if not elements:
+                    dom = self._run_async(self._browser.get_page_structure(), timeout=10)
+                    elements = dom.get("elements", [])
+
+                if elements:
+                    links = [e for e in elements
+                             if e["type"] in ("link", "nav_link", "video_related", "content_link",
+                                              "menuitem", "tab", "listitem", "option")]
+                    buttons = [e for e in elements if e["type"] == "button"]
+                    structures.append(f"[交互元素 {len(elements)}个]")
+                    if links:
+                        structures.append("链接: " + " | ".join(
+                            f"{l['text'][:25]}" + (f"→{l.get('href','')[:50]}" if l.get('href') else "")
+                            for l in links[:8]
+                        ))
+                    if buttons:
+                        structures.append("按钮: " + ", ".join(b["text"][:15] for b in buttons[:5]))
+            except Exception:
+                pass
+
+        page_desc = "; ".join(structures) if structures else "（无法获取页面信息）"
+
+        follow_msg = (
+            f"上一轮操作已完成。当前页面内容:\n{page_desc}\n\n"
+            "请基于这些信息给用户一个自然的回复"
+            "（描述页面内容/问用户想看什么/如果需要进一步操作则附加 JSON 动作）。"
+        )
+        self._chat_history.append({"role": "user", "content": follow_msg})
+
+        try:
+            result = self._deepseek.chat(
+                user_message=follow_msg,
+                conversation_history=self._chat_history,
+            )
+        except Exception as e:
+            self._gui.log(f"自动续问 DS 失败: {e}", "warn")
+            return
+
+        reply = result.get("reply", "")
+        follow_actions = result.get("actions", [])
+
+        if reply:
+            self._gui.assistant_say(reply)
+        self._chat_history.append({"role": "assistant", "content": reply})
+
+        if follow_actions:
+            self._gui.log(f"续问返回 {len(follow_actions)} 动作: {[a.get('type') for a in follow_actions]}", "dim")
+            # 不再自动续问（防无限循环）
+            self._execute_ds_actions(follow_actions, "")
 
     def _fmt_page_items(self, items: list[dict], max_items: int = 20) -> str:
         """格式化页面元素为 DS 易读的列表。"""
