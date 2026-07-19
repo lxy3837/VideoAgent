@@ -728,7 +728,7 @@ class VideoAgent:
                         links = [e for e in elements
                                  if e["type"] in ("link", "nav_link", "video_related", "content_link",
                                                   "menuitem", "tab", "listitem", "option")]
-                        buttons = [e for e in elements if e["type"] == "button"]
+                        buttons = [e for e in elements if e["type"] in ("button", "clickable")]
                         headings = [e for e in elements if e["type"] == "heading"]
 
                         structures.append(f"[交互元素 {len(elements)}个]")
@@ -943,8 +943,8 @@ class VideoAgent:
             page_source = page_data.get("source", "dom")
 
             # 构建结构化摘要给 DS（兼容 AX tree 和 DOM 两种格式）
-            links = [e for e in elements if e["type"] in ("link", "nav_link", "video_related", "content_link")]
-            buttons = [e for e in elements if e["type"] == "button"]
+            links = [e for e in elements if e["type"] in ("link", "nav_link", "video_related", "content_link", "clickable")]
+            buttons = [e for e in elements if e["type"] in ("button", "clickable")]
             headings = [e for e in elements if e["type"] == "heading"]
             search_boxes = [e for e in elements if e["type"] == "search_box"]
 

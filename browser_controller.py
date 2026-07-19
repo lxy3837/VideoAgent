@@ -1284,6 +1284,7 @@ class BrowserController:
                 });
 
                 // 2. 按钮 / 可点击元素
+                const seenClickableTexts = new Set();
                 const clickables = document.querySelectorAll('button, [role="button"], [class*="btn"], [onclick], input[type="submit"], input[type="button"]');
                 clickables.forEach(el => {
                     if (!visible(el)) return;
@@ -1291,8 +1292,34 @@ class BrowserController:
                     if (t) {
                         const href = el.tagName === 'A' ? (el.href || '') : '';
                         data.elements.push({type: 'button', text: t, href: href, selector: css(el)});
+                        seenClickableTexts.add(t);
                     }
                 });
+
+                // 2b. Vue / JS 事件监听元素（div/span/li 等非语义元素但有 click 行为）
+                //    策略：cursor:pointer + Vue 实例检测，覆盖 <div @click> 等 SPA 组件
+                const allEls = document.querySelectorAll('*');
+                for (let i = 0; i < allEls.length && data.elements.length < 80; i++) {
+                    const el = allEls[i];
+                    if (!visible(el)) continue;
+                    const tag = el.tagName.toLowerCase();
+                    // 跳过已有语义的标签（已被上面抓到或天然可点击）
+                    if (tag === 'a' || tag === 'button' || tag === 'input' || tag === 'select' || tag === 'textarea') continue;
+                    const t = text(el);
+                    if (!t || seenClickableTexts.has(t)) continue;
+                    // 检测1: cursor:pointer（几乎所有的可点击元素都有）
+                    const style = getComputedStyle(el);
+                    if (style.cursor === 'pointer') {
+                        data.elements.push({type: 'clickable', text: t, selector: css(el)});
+                        seenClickableTexts.add(t);
+                        continue;
+                    }
+                    // 检测2: Vue 实例绑定（__vue__ Vue2 / __vue_app__ Vue3 / _vnode 组件节点）
+                    if (el.__vue__ || el.__vue_app__ || el.__vnode) {
+                        data.elements.push({type: 'clickable', text: t, selector: css(el)});
+                        seenClickableTexts.add(t);
+                    }
+                }
 
                 // 3. 视频相关元素（推荐列表、播放列表、下一集按钮等）
                 const videoAreas = document.querySelectorAll(
