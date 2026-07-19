@@ -1075,3 +1075,121 @@ class BrowserController:
             await asyncio.sleep(0.3)
 
         return results
+
+    async def get_page_structure(self) -> dict:
+        """提取页面关键交互元素，供 AI 分析跳转入口、导航等。
+
+        返回结构化的页面骨架，不含完整 HTML（太大），只提取：
+        - 导航链接
+        - 按钮/可点击元素
+        - 视频相关（推荐、播放列表、下一集）
+        - 搜索框
+        - 当前页面标题和 URL
+        """
+        if not self._page:
+            return {"error": "未连接到任何页面", "elements": []}
+
+        result = await self._page.evaluate("""
+            (() => {
+                const data = {
+                    title: document.title || '',
+                    url: location.href,
+                    elements: []
+                };
+
+                // 辅助：获取元素文本（截断到80字符）
+                const text = (el) => {
+                    const t = (el.textContent || el.getAttribute('aria-label') || el.title || '').trim();
+                    return t ? t.replace(/\\s+/g, ' ').substring(0, 80) : '';
+                };
+
+                // 辅助：获取元素的 CSS 选择器（简化）
+                const css = (el) => {
+                    if (el.id) return '#' + el.id;
+                    const cls = (el.className || '').toString().trim().split(/\\s+/).slice(0, 2).join('.');
+                    const tag = el.tagName.toLowerCase();
+                    return cls ? tag + '.' + cls : tag;
+                };
+
+                // 辅助：判定元素是否可见
+                const visible = (el) => {
+                    const r = el.getBoundingClientRect();
+                    const s = getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+                };
+
+                // 1. 导航区域链接
+                const navAreas = document.querySelectorAll('nav, header, [class*="nav"], [class*="header"], [class*="menu"], [class*="sidebar"], [class*="left-panel"]');
+                navAreas.forEach(area => {
+                    area.querySelectorAll('a[href]').forEach(a => {
+                        if (!visible(a)) return;
+                        const t = text(a);
+                        const href = a.href || a.getAttribute('href') || '';
+                        if (t && href && !href.startsWith('javascript:') && !href.startsWith('#')) {
+                            data.elements.push({type: 'nav_link', text: t, href: href, selector: css(a)});
+                        }
+                    });
+                });
+
+                // 2. 按钮 / 可点击元素
+                const clickables = document.querySelectorAll('button, [role="button"], [class*="btn"], [onclick], input[type="submit"], input[type="button"]');
+                clickables.forEach(el => {
+                    if (!visible(el)) return;
+                    const t = text(el);
+                    if (t) {
+                        const href = el.tagName === 'A' ? (el.href || '') : '';
+                        data.elements.push({type: 'button', text: t, href: href, selector: css(el)});
+                    }
+                });
+
+                // 3. 视频相关元素（推荐列表、播放列表、下一集按钮等）
+                const videoAreas = document.querySelectorAll(
+                    '[class*="video"], [class*="playlist"], [class*="recommend"], [class*="related"], ' +
+                    '[class*="episode"], [class*="chapter"], [class*="collection"], [class*="card"], ' +
+                    '[class*="list"] a[href], [class*="suggest"] a[href]'
+                );
+                const seenHrefs = new Set();
+                videoAreas.forEach(el => {
+                    const t = text(el);
+                    const href = el.href || el.getAttribute('href') || '';
+                    if (t && href && !href.startsWith('javascript:') && !seenHrefs.has(href)) {
+                        seenHrefs.add(href);
+                        data.elements.push({type: 'video_related', text: t, href: href, selector: css(el)});
+                    }
+                });
+
+                // 4. 搜索框
+                const searchBoxes = document.querySelectorAll('input[type="search"], input[placeholder*="搜"], input[placeholder*="search"], input[name*="search"], input[name*="keyword"], input[id*="search"], input[class*="search"]');
+                searchBoxes.forEach(el => {
+                    if (!visible(el)) return;
+                    const ph = el.getAttribute('placeholder') || '';
+                    data.elements.push({type: 'search_box', text: ph, selector: css(el)});
+                });
+
+                // 5. 主要内容区域链接（可能是教程目录、课程列表等）
+                const mainAreas = document.querySelectorAll('main, [class*="content"], [class*="main"], article, [class*="article"]');
+                mainAreas.forEach(area => {
+                    area.querySelectorAll('a[href]').forEach(a => {
+                        if (!visible(a)) return;
+                        const t = text(a);
+                        const href = a.href || a.getAttribute('href') || '';
+                        if (t && href && !href.startsWith('javascript:') && !href.startsWith('#') && !seenHrefs.has(href)) {
+                            seenHrefs.add(href);
+                            data.elements.push({type: 'content_link', text: t, href: href, selector: css(a)});
+                        }
+                    });
+                });
+
+                // 去重 + 限制总数
+                const seen = new Set();
+                data.elements = data.elements.filter(e => {
+                    const key = e.text + e.href;
+                    if (seen.has(key)) return false;
+                    seen.add(key);
+                    return true;
+                }).slice(0, 80);  // 最多 80 个元素
+
+                return data;
+            })()
+        """)
+        return result

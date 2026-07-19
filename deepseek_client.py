@@ -339,7 +339,7 @@ class DeepSeekClient:
         )
         for atype in action_pattern:
             if atype in ("seek", "pause", "play", "screenshot", "navigate",
-                         "analyze", "status", "search"):
+                         "analyze", "status", "search", "get_page", "new_session"):
                 a = {"type": atype}
                 if atype == "seek":
                     tm = re.search(r'"time"\s*:\s*([\d.]+)', text)
@@ -369,6 +369,7 @@ CHAT_SYSTEM_PROMPT = """你是 VideoAgent，一个能控制浏览器看视频的
 - 截图当前画面
 - 启动自动分析（边看边截图+总结）
 - 查看视频播放状态
+- 查看页面结构（找到导航入口、推荐列表等，然后帮用户跳转）
 
 **你的回复格式**（混合文字+JSON）：
 先用自然语言回复用户，**只在需要执行操作时**，附加一个 JSON 块：
@@ -391,6 +392,18 @@ CHAT_SYSTEM_PROMPT = """你是 VideoAgent，一个能控制浏览器看视频的
 - analyze — 启动自动循环分析
 - status — 查看播放状态
 - search(query) — 搜索视频（会打开搜索结果页）
+- get_page — 请求当前页面 HTML 结构（导航链接、推荐列表、按钮等），拿到结果后需要二次分析并导航
+- new_session — 关闭当前分析会话，用新文件夹开始新一轮分析
+
+**get_page 使用场景**：
+- 用户说"帮我找 xx 教程"/"打开主页推荐的第一个视频"/"看看有哪些课程"
+- 当前页面是搜索结果页/课程列表页/播放列表页，需要你选择具体链接
+- 工作流程：先发 get_page → 系统回传页面结构 → 你分析后发 navigate(url) 跳转
+
+**new_session 使用场景**：
+- 用户切换到一个全新的视频，需要独立文件夹
+- 用户说"换个视频分析"/"重新开始"/"开新分析"
+- 工作流程：发 new_session → 系统自动创建新会话文件夹并开始分析
 
 **规则**：
 - 纯聊天时不需要 JSON 块，直接文字回复即可
@@ -400,6 +413,7 @@ CHAT_SYSTEM_PROMPT = """你是 VideoAgent，一个能控制浏览器看视频的
 - analyze 命令会启动完整的字幕转录+定时分析流程
 - 用户说"帮我分析"或"开始分析"时 → 执行 analyze
 - 用户说"打开/搜索 xxx 视频"时 → 先用 search 或 navigate
+- 用户在搜索结果页/列表页（没有视频正在播放）时 → 用 get_page 查看页面结构，找到匹配的链接后 navigate
 - 回复简洁友好，中文"""
 
 

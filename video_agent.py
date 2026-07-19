@@ -720,10 +720,13 @@ class VideoAgent:
         # 执行动作
         if actions:
             self._gui.log(f"DS 返回 {len(actions)} 个动作: {[a.get('type') for a in actions]}", "dim")
-            self._execute_ds_actions(actions)
+            self._execute_ds_actions(actions, text)
 
-    def _execute_ds_actions(self, actions: list[dict]):
-        """执行 DeepSeek 返回的动作指令。"""
+    def _execute_ds_actions(self, actions: list[dict], user_text: str = ""):
+        """执行 DeepSeek 返回的动作指令。
+
+        get_page 动作会触发二次 DS 调用：拿到页面结构后回传给 DS 分析跳转入口。
+        """
         if not self._browser.connected or not self._browser.has_video_page:
             for a in actions:
                 t = a.get("type", "")
@@ -731,10 +734,27 @@ class VideoAgent:
                     self._gui.assistant_say("请先连接浏览器。输入「帮我分析」自动处理。")
                     return
 
+        needs_page_roundtrip = False
+
         for act in actions:
             t = act.get("type", "")
             try:
-                if t == "seek":
+                if t == "get_page":
+                    # DS 请求查看当前页面结构 — 标记需要回传
+                    needs_page_roundtrip = True
+                    break  # 先处理 get_page，其他动作等二次决策
+
+                elif t == "new_session":
+                    # DS 决定开启新分析会话
+                    self._gui.log("DS 请求新会话", "accent")
+                    self._session_dir = ""
+                    self._stop_requested = True
+                    self._analyzing = False
+                    self._gui.assistant_say("正在创建新会话...")
+                    self._one_click_analyze()
+                    return
+
+                elif t == "seek":
                     target = float(act.get("time", 0))
                     self._run_async(self._browser.seek(target))
                     self._gui.log(f"  ⏩ seek {target:.0f}s", "dim")
@@ -776,6 +796,83 @@ class VideoAgent:
 
             except Exception as e:
                 self._gui.log(f"  动作 {t} 失败: {e}", "warn")
+
+        # ── get_page 二次决策：拿到页面结构 → 回传给 DS 分析跳转入口 ──
+        if needs_page_roundtrip:
+            self._gui.log("DS 请求页面结构，正在提取...", "accent")
+            try:
+                page_data = self._run_async(self._browser.get_page_structure())
+                elements = page_data.get("elements", [])
+                page_title = page_data.get("title", "")
+                page_url = page_data.get("url", "")
+
+                # 构建结构化摘要给 DS
+                nav_links = [e for e in elements if e["type"] == "nav_link"]
+                buttons = [e for e in elements if e["type"] == "button"]
+                video_items = [e for e in elements if e["type"] == "video_related"]
+                content_links = [e for e in elements if e["type"] == "content_link"]
+                search_boxes = [e for e in elements if e["type"] == "search_box"]
+
+                page_summary = f"""当前页面: {page_title}
+URL: {page_url}
+
+可见交互元素共 {len(elements)} 个:
+
+【导航链接】({len(nav_links)}个):
+{self._fmt_page_items(nav_links[:20])}
+
+【视频推荐/播放列表】({len(video_items)}个):
+{self._fmt_page_items(video_items[:15])}
+
+【主要内容链接】({len(content_links)}个):
+{self._fmt_page_items(content_links[:15])}
+
+【按钮】({len(buttons)}个):
+{self._fmt_page_items(buttons[:10])}
+
+【搜索框】({len(search_boxes)}个):
+{self._fmt_page_items(search_boxes[:5])}"""
+
+                self._gui.log(f"页面结构: {len(elements)} 个元素 -> 回传 DS 分析", "dim")
+
+                # 回传 DS 做二次决策
+                follow_msg = f"请分析以下页面结构，用户原话「{user_text}」。找到最匹配的链接并导航：\n\n{page_summary}"
+                self._chat_history.append({"role": "user", "content": follow_msg})
+
+                try:
+                    result = self._deepseek.chat(
+                        user_message=follow_msg,
+                        conversation_history=self._chat_history,
+                    )
+                except Exception as e:
+                    self._gui.assistant_say(f"DS 二次调用失败: {e}")
+                    return
+
+                reply = result.get("reply", "")
+                follow_actions = result.get("actions", [])
+
+                if reply:
+                    self._gui.assistant_say(reply)
+                self._chat_history.append({"role": "assistant", "content": reply})
+
+                if follow_actions:
+                    self._gui.log(f"DS 二次返回 {len(follow_actions)} 个动作: {[a.get('type') for a in follow_actions]}", "dim")
+                    self._execute_ds_actions(follow_actions, user_text)
+
+            except Exception as e:
+                self._gui.assistant_say(f"获取页面结构失败: {e}")
+                self._gui.log(f"get_page 失败: {e}", "warn")
+
+    def _fmt_page_items(self, items: list[dict], max_items: int = 20) -> str:
+        """格式化页面元素为 DS 易读的列表。"""
+        lines = []
+        for i, item in enumerate(items[:max_items]):
+            t = item["text"][:60]
+            href = item.get("href", "")[:80]
+            lines.append(f"  [{i}] {t}")
+            if href:
+                lines.append(f"      → {href}")
+        return "\n".join(lines) if lines else "  (无)"
 
     def _screenshot_at_current(self, name: str):
         """在当前时间点截图并命名。"""
