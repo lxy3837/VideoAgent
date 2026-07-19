@@ -767,6 +767,48 @@ class BrowserController:
     def has_video_page(self) -> bool:
         return self._page is not None
 
+    async def ensure_active_tab(self) -> bool:
+        """确保 self._page 始终指向用户当前正在看的可见标签页。
+
+        如果当前 page 已挂起/不可见/被关闭，自动切换到可见标签页。
+        在 get_page_structure、get_state 等之前调用，保证拿到的是用户看到的页面。
+        """
+        if not self._browser:
+            return False
+
+        # 检查当前 page 是否还活着且可见
+        if self._page:
+            try:
+                visible = await self._page.evaluate("() => document.visibilityState === 'visible'")
+                if visible:
+                    return True  # 当前就是可见的，无需切换
+            except Exception:
+                pass  # page 可能已关闭
+
+        # 当前 page 不可见或已死 → 切到用户正在看的标签页
+        for ctx in (self._browser.contexts or []):
+            for page in ctx.pages:
+                try:
+                    visible = await page.evaluate("() => document.visibilityState === 'visible'")
+                    if visible:
+                        self._page = page
+                        print(f"[Browser] 已切换到可见标签页: {await page.title()}")
+                        return True
+                except Exception:
+                    continue
+
+        # 所有标签页都不活跃 → 保留第一个可用的
+        for ctx in (self._browser.contexts or []):
+            for page in ctx.pages:
+                try:
+                    await page.title()  # 测试是否可用
+                    self._page = page
+                    return True
+                except Exception:
+                    continue
+
+        return False
+
     # ── 页面管理 ──
 
     async def list_pages(self) -> list[dict]:
@@ -888,18 +930,41 @@ class BrowserController:
 
                     // 自定义播放器（常见视频网站的播放器容器）
                     const playerPatterns = [
-                        '.bpx-player-video-area',  // B站
+                        // B站
+                        '.bpx-player-video-area',
                         '#bilibili-player',
-                        '.html5-video-player',     // YouTube
+                        // YouTube
+                        '.html5-video-player',
                         '.ytd-player',
-                        '.video-js',               // Video.js
+                        // 开源播放器
+                        '.video-js',
                         '.jwplayer',
-                        '.tcplayer',               // 腾讯
-                        '.prism-player',           // 阿里
-                        '[data-player]',
-                        '[data-video-id]',
                         '.dplayer',
                         '.xgplayer',
+                        '.plyr',
+                        '.fluid-player',
+                        // 腾讯系
+                        '.tcplayer',
+                        '.txp_player',
+                        '[class*="tencent"] [class*="player"]',
+                        // 阿里系
+                        '.prism-player',
+                        // 小鹅通 / 知识付费平台
+                        '[class*="xiaoetong"] [class*="player"]',
+                        '[class*="player-container"]',
+                        '[class*="video-wrap"]',
+                        '[class*="player-wrapper"]',
+                        '[class*="course-player"]',
+                        '[class*="lesson-player"]',
+                        '[class*="live-player"]',
+                        // 其他教育平台
+                        '[class*="mukewang"] [class*="player"]',
+                        '[class*="study"] [class*="video"]',
+                        '[class*="edu"] [class*="player"]',
+                        // 通用属性
+                        '[data-player]',
+                        '[data-video-id]',
+                        '[data-video]',
                     ];
                     playerPatterns.forEach(sel => {
                         const el = document.querySelector(sel);
@@ -941,6 +1006,38 @@ class BrowserController:
                         }
                     }
 
+                    // 兜底启发式扫描：上面都没找到，搜"长得像播放器的大块区域"
+                    if (result.custom_players.length === 0 && result.videos.length === 0) {
+                        const allDivs = document.querySelectorAll('div, section');
+                        allDivs.forEach(el => {
+                            const rect = el.getBoundingClientRect();
+                            // 播放器通常 > 400x250 且在视口内
+                            if (rect.width < 400 || rect.height < 250) return;
+                            if (rect.top < -200 || rect.top > window.innerHeight) return;
+                            const cls = (el.className || '').toString().toLowerCase();
+                            const id = (el.id || '').toLowerCase();
+                            const hasKeyword = cls.includes('video') || cls.includes('player') ||
+                                cls.includes('播放') || id.includes('video') || id.includes('player');
+                            const hasVideoInside = !!el.querySelector('video, iframe, canvas, audio');
+                            if (hasKeyword || hasVideoInside) {
+                                const innerVideo = el.querySelector('video');
+                                result.custom_players.push({
+                                    selector: id ? '#' + id : '.' + cls.split(' ')[0],
+                                    tagName: el.tagName.toLowerCase(),
+                                    width: rect.width,
+                                    height: rect.height,
+                                    hasVideoInside: !!innerVideo,
+                                    innerVideoSelector: innerVideo ? (
+                                        innerVideo.id ? '#' + innerVideo.id :
+                                        innerVideo.className ? '.' + innerVideo.className.split(' ')[0] :
+                                        'video'
+                                    ) : null,
+                                    source: 'heuristic',
+                                });
+                            }
+                        });
+                    }
+
                     return result;
                 }
             """)
@@ -957,7 +1054,8 @@ class BrowserController:
     # ── 状态 ──
 
     async def get_state(self) -> VideoState | None:
-        """获取当前视频播放状态。"""
+        """获取当前视频播放状态。先确保 page 指向用户可见的标签页。"""
+        await self.ensure_active_tab()
         if not self._page:
             return None
         return await _read_video_state(self._page, self._video_selector)
@@ -1022,8 +1120,11 @@ class BrowserController:
         await self._page.screenshot(path=save_path, full_page=False)
         return save_path
 
-    async def navigate(self, url: str):
-        """导航到指定 URL（在已连接的页面中打开）。"""
+    async def navigate(self, url: str, wait_spa: bool = True):
+        """导航到指定 URL（在已连接的页面中打开）。
+
+        wait_spa=True: 等待 SPA（Vue/React）渲染完成后再返回。
+        """
         if not self._browser:
             raise RuntimeError("浏览器未连接")
         # 在现有页面导航
@@ -1034,6 +1135,38 @@ class BrowserController:
             if ctx:
                 self._page = await ctx.new_page()
                 await self._page.goto(url, wait_until="domcontentloaded")
+
+        if wait_spa:
+            await self._wait_for_spa_render()
+
+    async def _wait_for_spa_render(self, timeout: float = 15.0) -> bool:
+        """等待 SPA 页面渲染完成。检测 Vue/React 挂载点出现非空内容。"""
+        if not self._page:
+            return False
+        try:
+            await self._page.wait_for_function("""
+                () => {
+                    // 检查常见 SPA 挂载点是否有可见内容
+                    const mounts = ['#app', '#root', '[data-app]', 'main', '#__next', '#__nuxt'];
+                    for (const sel of mounts) {
+                        const el = document.querySelector(sel);
+                        if (el) {
+                            const rect = el.getBoundingClientRect();
+                            const hasChildren = el.children.length > 0;
+                            const hasText = (el.textContent || '').trim().length > 50;
+                            if (rect.width > 0 && (hasChildren || hasText)) return true;
+                        }
+                    }
+                    // 兜底：body 至少有一个大块内容
+                    const body = document.body;
+                    if (body && body.textContent.trim().length > 200) return true;
+                    return false;
+                }
+            """, timeout=timeout * 1000)
+            return True
+        except Exception:
+            # 超时也算了，不影响后续流程
+            return False
 
     async def capture_batch(
         self,
@@ -1076,20 +1209,19 @@ class BrowserController:
 
         return results
 
-    async def get_page_structure(self) -> dict:
+    async def get_page_structure(self, retry_until_content: bool = True) -> dict:
         """提取页面关键交互元素，供 AI 分析跳转入口、导航等。
 
-        返回结构化的页面骨架，不含完整 HTML（太大），只提取：
-        - 导航链接
-        - 按钮/可点击元素
-        - 视频相关（推荐、播放列表、下一集）
-        - 搜索框
-        - 当前页面标题和 URL
+        retry_until_content=True: 如果结果为空（SPA 未渲染完），等待并重试最多 3 次。
+        每次调用前确保 page 指向用户可见的标签页。
         """
+        await self.ensure_active_tab()
         if not self._page:
             return {"error": "未连接到任何页面", "elements": []}
 
-        result = await self._page.evaluate("""
+        max_retries = 3 if retry_until_content else 1
+        for attempt in range(max_retries):
+            result = await self._page.evaluate("""
             (() => {
                 const data = {
                     title: document.title || '',
@@ -1191,5 +1323,12 @@ class BrowserController:
 
                 return data;
             })()
-        """)
+            """)
+            # 如果结果有内容，或不需要重试，直接返回
+            if not retry_until_content or len(result.get("elements", [])) >= 3:
+                return result
+            # SPA 可能还没渲染完——等 2 秒再试
+            if attempt < max_retries - 1:
+                print(f"[Browser] 页面元素为空（SPA 可能未渲染），第 {attempt+1} 次重试...")
+                await asyncio.sleep(2)
         return result

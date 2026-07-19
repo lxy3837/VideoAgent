@@ -956,6 +956,10 @@ URL: {page_url}
                 return
             self._gui.assistant_say("浏览器已连接 ✓")
 
+        # Step 1.5: 确保当前 page 指向用户正在看的标签页（不碰其他窗口）
+        self._run_async(self._browser.ensure_active_tab())
+        self._gui.log("已锁定用户可见标签页", "dim")
+
         # Step 2: 收集页面上下文
         page_title = ""
         page_url = ""
