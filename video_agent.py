@@ -692,33 +692,58 @@ class VideoAgent:
             "has_video": page_context["has_video"],
         } if self._browser.connected else None
 
-        # 非视频页自动附上页面结构，让 DS 能「看到」当前页面有什么
+        # 自动附上页面结构，让 DS 知道当前页面有什么（非视频页用 AX tree+DOS 兜底）
         user_text = text
-        if self._browser.connected and not page_context.get("has_video"):
-            try:
-                structure = self._run_async(self._browser.get_page_ax_tree(), timeout=5)
-                elements = structure.get("elements", [])
-                if elements:
-                    links = [e for e in elements if e["type"] in ("link", "menuitem", "tab")]
-                    buttons = [e for e in elements if e["type"] == "button"]
-                    headings = [e for e in elements if e["type"] == "heading"]
-                    search_boxes = [e for e in elements if e["type"] == "search_box"]
+        if self._browser.connected:
+            structures = []
 
-                    parts = ["\n---\n当前页面可见内容："]
-                    if headings:
-                        parts.append("[页面标题] " + " > ".join(h["text"][:40] for h in headings[:5]))
-                    if links:
-                        parts.append("[链接] " + " | ".join(
-                            f"{l['text'][:30]}" + (f"→{l.get('href','')[:60]}" if l.get('href') else "")
-                            for l in links[:15]
-                        ))
-                    if buttons:
-                        parts.append("[按钮] " + ", ".join(b["text"][:25] for b in buttons[:8]))
-                    if search_boxes:
-                        parts.append("[搜索框] " + ", ".join(s["text"][:25] for s in search_boxes[:3]))
-                    user_text = text + "\n".join(parts)
-            except Exception:
-                pass  # 获取失败不阻塞正常聊天
+            # 基本信息（始终附上）
+            if page_context.get("page_title"):
+                structures.append(f"[页面] {page_context['page_title'][:60]}")
+            if page_context.get("page_url"):
+                structures.append(f"[URL] {page_context['page_url'][:80]}")
+            if page_context.get("has_video"):
+                t = page_context.get("video_time", 0)
+                d = page_context.get("duration", 0)
+                p = "暂停" if page_context.get("paused") else "播放中"
+                structures.append(f"[视频] {t:.0f}s/{d:.0f}s {p}")
+
+            # 非视频页 → 附页面元素
+            if not page_context.get("has_video"):
+                try:
+                    elements = []
+                    # 先试 AX tree
+                    ax = self._run_async(self._browser.get_page_ax_tree(), timeout=5)
+                    elements = ax.get("elements", [])
+                    if not elements:
+                        # AX tree 为空（如 Vue SPA 用 div+click 替代 a/button）→ 回退 DOM 扫描
+                        self._gui.log("AX tree 为空，回退 DOM...", "dim")
+                        dom = self._run_async(self._browser.get_page_structure(), timeout=10)
+                        elements = dom.get("elements", [])
+
+                    if elements:
+                        links = [e for e in elements
+                                 if e["type"] in ("link", "nav_link", "video_related", "content_link",
+                                                  "menuitem", "tab", "listitem", "option")]
+                        buttons = [e for e in elements if e["type"] == "button"]
+                        headings = [e for e in elements if e["type"] == "heading"]
+
+                        structures.append(f"[交互元素 {len(elements)}个]")
+                        if links:
+                            structures.append(
+                                "链接: " + " | ".join(
+                                    f"{l['text'][:25]}" + (f"→{l.get('href','')[:50]}" if l.get('href') else "")
+                                    for l in links[:12]
+                                ))
+                        if buttons:
+                            structures.append("按钮: " + ", ".join(b["text"][:20] for b in buttons[:6]))
+                        if headings:
+                            structures.append("章节: " + ", ".join(h["text"][:30] for h in headings[:6]))
+                except Exception:
+                    pass  # 获取失败不阻塞聊天
+
+            if structures:
+                user_text = text + "\n---\n当前页面：" + "; ".join(structures)
 
         try:
             result = self._deepseek.chat(
@@ -811,6 +836,11 @@ class VideoAgent:
                         self._gui.log(f"  导航: {url}", "dim")
                         self._run_async(self._browser.navigate(url))
                         self._gui.assistant_say(f"已打开 {url}")
+                        # 标记到历史，下次 DS 知道已导航过此地
+                        self._chat_history.append({
+                            "role": "system",
+                            "content": f"（系统已导航到 {url}，当前页面即此地址。用户接下来问的是这个页面上的问题，不要重复导航。）"
+                        })
 
                 elif t == "search":
                     query = act.get("query", "")
@@ -819,6 +849,10 @@ class VideoAgent:
                         self._gui.log(f"  搜索: {query}", "dim")
                         self._run_async(self._browser.navigate(search_url))
                         self._gui.assistant_say(f"已搜索: {query}")
+                        self._chat_history.append({
+                            "role": "system",
+                            "content": f"（系统已搜索 {query}，当前在搜索结果页。用户接下来问的是结果页上的问题，不要重复搜索。）"
+                        })
 
                 elif t == "analyze":
                     # DS 已决策要分析 → 直接设置会话并启动
