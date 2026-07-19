@@ -776,26 +776,45 @@ class BrowserController:
         if not self._browser:
             return False
 
+        _NTP_PREFIXES = ("chrome://", "edge://", "about:", "https://ntp.msn.cn")
+
+        def _is_ntp(page_url: str) -> bool:
+            """检测是否为空白页/NTP（没有用户内容的页面）。"""
+            url = (page_url or "").lower()
+            return any(url.startswith(p) for p in _NTP_PREFIXES) or url.strip() == ""
+
         # 检查当前 page 是否还活着且可见
         if self._page:
             try:
                 visible = await self._page.evaluate("() => document.visibilityState === 'visible'")
-                if visible:
+                if visible and not _is_ntp(self._page.url):
                     return True  # 当前就是可见的，无需切换
             except Exception:
                 pass  # page 可能已关闭
 
         # 当前 page 不可见或已死 → 切到用户正在看的标签页
+        # 收集所有可见页，排除 NTP 空白页
+        candidate_pages = []
         for ctx in (self._browser.contexts or []):
             for page in ctx.pages:
                 try:
                     visible = await page.evaluate("() => document.visibilityState === 'visible'")
-                    if visible:
-                        self._page = page
-                        print(f"[Browser] 已切换到可见标签页: {await page.title()}")
-                        return True
+                    url = page.url
+                    if visible and not _is_ntp(url):
+                        # 有实际内容的可见页 → 高优先级
+                        candidate_pages.insert(0, page)
+                        break  # 一般只有一个可见标签页有实际内容
+                    elif visible:
+                        # NTP/空白可见页 → 备用
+                        candidate_pages.append(page)
                 except Exception:
                     continue
+
+        # 优先取有内容的
+        for page in candidate_pages:
+            self._page = page
+            print(f"[Browser] 已切换到可见标签页: {await page.title()}")
+            return True
 
         # 所有标签页都不活跃 → 保留第一个可用的
         for ctx in (self._browser.contexts or []):

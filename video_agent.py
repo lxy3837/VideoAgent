@@ -1009,24 +1009,42 @@ class VideoAgent:
     def _start_agent(self):
         """启动 Agent：只连接浏览器 + 锁定用户可见标签页。不分析、不决策。
 
-        后续用户说「帮我分析」「帮我找视频」时，由 _handle_ds_chat 带页面上下文交给 DS 决策。
+        不走 connect_browser()（它会调用 _find_video_page 找 <video> 标签，
+        非视频页会导致 self._page 被设为 None）。
         """
         self._gui.log("启动 Agent...", "accent")
 
         if not self._browser.connected:
             self._gui.assistant_say("正在连接浏览器...")
-            ok = self.connect_browser(auto_start=True)
+            self._start_async_loop()
+            try:
+                ok = self._run_async(self._browser.connect(auto_start=True), timeout=120)
+            except Exception as e:
+                self._gui.log(f"浏览器连接异常: {e}", "error")
+                self._gui.assistant_say("浏览器连接超时。请关闭所有 Edge 窗口后重试。")
+                return False
             if not ok:
                 self._gui.assistant_say(
-                    "浏览器启动失败。请确认 Edge 已安装且任务管理器中没有残留的 msedge 进程。"
+                    "未检测到 Edge 调试模式。\n请关闭 Edge，用桌面「Edge (调试模式)」快捷方式重开。"
                 )
                 return False
             self._gui.assistant_say("浏览器已连接 ✓")
 
-        # 锁定用户正在看的标签页
+        # 锁定用户正在看的标签页（不找视频页）
         self._run_async(self._browser.ensure_active_tab())
-        self._gui.log("已锁定用户可见标签页", "dim")
-        self._gui.assistant_say("Agent 已就绪！可以跟我说「帮我分析」「帮我找视频」或任何你想做的事。")
+        page_title = ""
+        try:
+            state = self._run_async(self._browser.get_state(), timeout=5)
+            page_title = state.get("page_title", "")
+        except Exception:
+            pass
+        self._gui.log(
+            f"已锁定标签页: {page_title[:40] if page_title else '(未知)'}", "dim"
+        )
+        self._gui.set_status({"connected": True})
+        self._gui.assistant_say(
+            "Agent 已就绪！可以跟我说「帮我分析」「帮我找视频」或任何你想做的事。"
+        )
         return True
 
     # ── 会话文件夹 ──
