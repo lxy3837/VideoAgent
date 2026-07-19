@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import time
@@ -1425,3 +1426,85 @@ class BrowserController:
             "elements": result,
             "source": "ax_tree",  # 标记数据来源
         }
+
+    # ── 页面交互（点击）──
+
+    async def click_element(
+        self,
+        text: str | None = None,
+        selector: str | None = None,
+        index: int = 0,
+    ) -> bool:
+        """点击页面上的元素。
+
+        Args:
+            text:     按可见文本匹配（优先用这个，DS 从 AX tree 拿到文本后直接点）
+            selector: CSS 选择器（精确控制）
+            index:    匹配第几个（text 匹配到多个时用）
+
+        Returns:
+            True 如果成功点击，False 如果未找到元素
+        """
+        if not self._page:
+            return False
+
+        try:
+            await self.ensure_active_tab()
+        except Exception:
+            pass
+
+        try:
+            if text:
+                # 文本匹配：优先精确匹配，回退模糊匹配
+                locator = self._page.get_by_text(text, exact=True)
+                count = await locator.count()
+                if count == 0:
+                    locator = self._page.get_by_text(text, exact=False)
+                    count = await locator.count()
+
+                if count > 0:
+                    target = locator.nth(min(index, count - 1))
+                    await target.scroll_into_view_if_needed()
+                    await target.click(timeout=5000)
+                    print(f"[Browser] 点击成功 (text='{text[:30]}', idx={index})")
+                    return True
+                else:
+                    print(f"[Browser] 未找到文本为 '{text[:30]}' 的可点击元素")
+
+            if selector:
+                locator = self._page.locator(selector)
+                count = await locator.count()
+                if count > 0:
+                    target = locator.nth(min(index, count - 1))
+                    await target.scroll_into_view_if_needed()
+                    await target.click(timeout=5000)
+                    print(f"[Browser] 点击成功 (selector='{selector[:60]}')")
+                    return True
+                else:
+                    print(f"[Browser] 未找到选择器 '{selector[:60]}'")
+
+        except Exception as e:
+            # 普通点击失败 → 尝试 JS click（绕过遮罩层/不可见等限制）
+            print(f"[Browser] 普通点击失败: {e}，尝试 JS click...")
+            try:
+                if text:
+                    js = f"""
+                        (() => {{
+                            const els = [...document.querySelectorAll('*')];
+                            const match = els.find(el =>
+                                el.textContent.trim().includes({json.dumps(text)}) &&
+                                el.offsetParent !== null &&
+                                !el.disabled
+                            );
+                            if (match) {{ match.click(); return true; }}
+                            return false;
+                        }})()
+                    """
+                    clicked = await self._page.evaluate(js)
+                    if clicked:
+                        print(f"[Browser] JS 点击成功 (text='{text[:30]}')")
+                        return True
+            except Exception as e2:
+                print(f"[Browser] 点击最终失败: {e2}")
+
+        return False

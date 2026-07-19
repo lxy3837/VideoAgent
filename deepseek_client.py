@@ -341,7 +341,7 @@ class DeepSeekClient:
             r'\{\s*"type"\s*:\s*"(\w+)"[^}]*\}', text
         )
         for atype in action_pattern:
-            if atype in ("seek", "pause", "play", "screenshot", "navigate",
+            if atype in ("seek", "pause", "play", "screenshot", "click", "navigate",
                          "analyze", "status", "search", "get_page", "new_session"):
                 a = {"type": atype}
                 if atype == "seek":
@@ -357,6 +357,13 @@ class DeepSeekClient:
                     if um:
                         key = "url" if atype == "navigate" else "query"
                         a[key] = um.group(1)
+                if atype == "click":
+                    tm = re.search(r'"text"\s*:\s*"([^"]*)"', text)
+                    if tm:
+                        a["text"] = tm.group(1)[:60]
+                    im = re.search(r'"index"\s*:\s*(\d+)', text)
+                    if im:
+                        a["index"] = int(im.group(1))
                 actions.append(a)
 
         return {"summary": summary, "actions": actions[:3]}
@@ -388,10 +395,16 @@ CHAT_SYSTEM_PROMPT = """你是 VideoAgent，一个能直接操控浏览器的 AI
 - seek(time) — 跳转到指定秒数
 - pause() / play() — 暂停/播放
 - screenshot(name) — 截图
+- click(text, index) — 点击页面上文本为 text 的元素（第 index 个匹配项，默认0）
 - analyze — 在视频页启动字幕+分析
 - search(query) — 搜索视频
 - get_page — 需要更详细的页面元素时（链接、按钮等），系统会回传并让你二次决策
 - new_session — 切换视频时新建会话文件夹
+
+**click 用法示例**：
+- 用户说「打开第十讲」→ 在页面元素中看到「第10讲·通信接口」→ click(text="第10讲·通信接口")
+- 列表页有多个「立即学习」按钮 → click(text="立即学习", index=2) 表示第3个
+- 不需要用 get_page → 你已经在消息里看到了页面元素，文本是「第10讲·通信接口」就直接 click
 
 **规则**：
 - 纯聊天不需要 JSON，直接文字回复

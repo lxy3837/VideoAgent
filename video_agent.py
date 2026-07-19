@@ -840,6 +840,33 @@ class VideoAgent:
                     name = act.get("name", "截图")
                     self._screenshot_at_current(name)
 
+                elif t == "click":
+                    click_text = act.get("text", "").strip()
+                    click_selector = act.get("selector", "").strip()
+                    click_index = int(act.get("index", 0))
+                    if click_text or click_selector:
+                        self._gui.log(
+                            f"  🖱 click "
+                            + (f"'{click_text[:30]}'" if click_text else f"selector='{click_selector[:40]}'")
+                            + (f" idx={click_index}" if click_index > 0 else ""),
+                            "dim",
+                        )
+                        state_changed = True  # 点击可能改变页面内容
+                        ok = self._run_async(
+                            self._browser.click_element(
+                                text=click_text or None,
+                                selector=click_selector or None,
+                                index=click_index,
+                            ),
+                            timeout=10,
+                        )
+                        if ok:
+                            self._gui.assistant_say(
+                                f"已点击「{click_text[:30] if click_text else click_selector[:30]}」"
+                            )
+                        else:
+                            self._gui.log("点击失败（未找到元素）", "warn")
+
                 elif t == "navigate":
                     url = act.get("url", "")
                     if url:
