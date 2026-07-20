@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import re
+import sys
 import time
 import subprocess
 import urllib.request
@@ -1696,21 +1697,40 @@ class BrowserController:
                 }});
             }});
 
-            // ═══ 8. 文本块 — p/span/div 有实质性文本（非交互，但给 DS 提供上下文） ═══
+            // ═══ 8. 文本块 — p/span/div 有实质性文本 ═══
+            //     Vue/React 通常在父级 div 上绑 @click（事件委托），子元素无 cursor:pointer。
+            //     这里向上查 3 层祖先：如果有 cursor:pointer，标记为 clickable 而非 text。
+            const ancestorClickable = (el) => {{
+                let p = el.parentElement;
+                for (let i = 0; i < 3 && p; i++) {{
+                    const role = p.getAttribute('role') || '';
+                    if (role === 'button' || role === 'link' || role === 'tab' || role === 'menuitem' || role === 'treeitem' || role === 'option') return true;
+                    if (getComputedStyle(p).cursor === 'pointer') return true;
+                    p = p.parentElement;
+                }}
+                return false;
+            }};
             const textBlocks = document.querySelectorAll('p, span, div, section, article, aside');
             for (let i = 0; i < textBlocks.length && elements.length < MAX; i++) {{
                 const el = textBlocks[i];
                 if (!visible(el)) continue;
                 // 跳过已有语义标签的父元素（它们内部的文本已被链接/按钮捕获）
-                const parentTag = el.closest('a,button,nav,header,footer') ? true : false;
-                if (parentTag) continue;
+                const parentSemantic = el.closest('a,button,nav,header,footer') ? true : false;
+                if (parentSemantic) continue;
                 const t = text(el);
-                // 只保留一段话以上的文本（>15字符），太短的可能是图标文字
-                if (t && t.length > 15 && t.split(/[，。！？,.!?;；]/).length > 2) {{
+                if (!t) continue;
+                const isClickable = !parentSemantic && ancestorClickable(el);
+                // 可点击项放宽阈值：≥3字即可（课程标题/按钮文字通常较短）
+                // 纯文本块保留原阈值：>15字且至少2个标点分段
+                const qualify = isClickable ? t.length >= 3 : (t.length > 15 && t.split(/[，。！？,.!?;；]/).length > 2);
+                if (qualify) {{
                     const tag = el.tagName.toLowerCase();
-                    // span/div 文本块标记为 text，p/article/section 直接标其标签
-                    const blockTag = (tag === 'span' || tag === 'div') ? 'text' : tag;
+                    const blockTag = isClickable ? 'clickable' : ((tag === 'span' || tag === 'div') ? 'text' : tag);
                     add({{tag: blockTag, text: t.substring(0, 120)}});
+                    // 标记为已处理，防止步骤 11 再次捕获父级导致重复
+                    if (isClickable && el.parentElement) {{
+                        seen.add('clickable|' + text(el.parentElement) + '||');
+                    }}
                 }}
             }}
 
@@ -1766,6 +1786,33 @@ class BrowserController:
         scan["source"] = "scan_page"
         return scan
 
+    # ── 页面滚动（触懒加载）──
+
+    async def scroll_page(self, direction: str = "down", amount: int = 0) -> dict:
+        """滚动页面，用于触发懒加载、翻看长列表。
+
+        Args:
+            direction: "down"（默认）| "up" | "bottom"（滚到底）| "top"（滚回顶）
+            amount:   方向键滚动量（px），0 则用 window.innerHeight * 0.8
+        """
+        if not self._page:
+            return {"ok": False, "error": "page not connected"}
+        try:
+            await self.ensure_active_tab()
+            if direction == "bottom":
+                await self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                return {"ok": True, "direction": "bottom"}
+            elif direction == "top":
+                await self._page.evaluate("window.scrollTo(0, 0)")
+                return {"ok": True, "direction": "top"}
+            else:
+                delta = amount or await self._page.evaluate("window.innerHeight * 0.8")
+                sign = -1 if direction == "up" else 1
+                await self._page.evaluate(f"window.scrollBy(0, {sign * int(delta)})")
+                return {"ok": True, "direction": direction, "px": int(delta)}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     # ── 页面交互（点击）──
 
     async def click_element(
@@ -1800,15 +1847,74 @@ class BrowserController:
                 if count == 0:
                     locator = self._page.get_by_text(text, exact=False)
                     count = await locator.count()
+                print(f"[Browser] get_by_text({text[:50]!r}) → count={count}", file=sys.stderr)
 
                 if count > 0:
                     target = locator.nth(min(index, count - 1))
-                    await target.scroll_into_view_if_needed()
+                    try:
+                        await target.scroll_into_view_if_needed(timeout=3000)
+                    except Exception:
+                        pass
                     await target.click(timeout=5000)
-                    print(f"[Browser] 点击成功 (text='{text[:30]}', idx={index})")
+                    print(f"[Browser] Playwright click OK (text={text[:30]!r})", file=sys.stderr)
                     return True
                 else:
-                    print(f"[Browser] 未找到文本为 '{text[:30]}' 的可点击元素")
+                    print(f"[Browser] Playwright get_by_text=0, trying JS deep scan...", file=sys.stderr)
+                    # JS 三段兜底，模拟真实鼠标事件
+                    js_found = await self._page.evaluate(f"""
+                        (() => {{
+                            const search = {json.dumps(text)};
+                            const all = [...document.querySelectorAll('*')];
+
+                            // 真实点击辅助：dispatch 完整鼠标事件序列
+                            const realClick = (el) => {{
+                                const rect = el.getBoundingClientRect();
+                                const cx = rect.left + rect.width / 2;
+                                const cy = rect.top + rect.height / 2;
+                                const opts = {{bubbles: true, cancelable: true, clientX: cx, clientY: cy}};
+                                el.dispatchEvent(new MouseEvent('mousedown', opts));
+                                el.dispatchEvent(new MouseEvent('mouseup', opts));
+                                el.dispatchEvent(new MouseEvent('click', opts));
+                            }};
+
+                            // 第1段：找可见元素中文本最短的那个（最精确，避免父级 div 包太多字）
+                            let best = null, bestLen = Infinity;
+                            for (const el of all) {{
+                                const t = el.textContent.trim();
+                                if (t.includes(search) && el.offsetParent !== null && !el.disabled) {{
+                                    if (t.length < bestLen) {{ best = el; bestLen = t.length; }}
+                                }}
+                            }}
+                            if (best) {{
+                                best.scrollIntoView({{block: 'center', behavior: 'instant'}});
+                                realClick(best);
+                                // 也给上级带 cursor:pointer 的元素来一下（Vue 事件委托）
+                                let p = best.parentElement;
+                                for (let i = 0; i < 3 && p; i++) {{
+                                    if (getComputedStyle(p).cursor === 'pointer' || p.getAttribute('role') === 'button') {{
+                                        setTimeout(() => realClick(p), 50);
+                                        break;
+                                    }}
+                                    p = p.parentElement;
+                                }}
+                                return true;
+                            }}
+
+                            // 第2段：不可见元素也尝试
+                            for (const el of all) {{
+                                if (el.textContent.trim().includes(search)) {{
+                                    el.scrollIntoView({{block: 'center', behavior: 'instant'}});
+                                    setTimeout(() => realClick(el), 100);
+                                    return true;
+                                }}
+                            }}
+                            return false;
+                        }})()
+                    """)
+                    if js_found:
+                        print(f"[Browser] JS deep scan OK (text={text[:30]!r})", file=sys.stderr)
+                        return True
+                    print(f"[Browser] JS deep scan FAILED — element not in DOM at all", file=sys.stderr)
 
             if selector:
                 locator = self._page.locator(selector)

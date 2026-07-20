@@ -402,12 +402,20 @@ CHAT_SYSTEM_PROMPT = """你是 VideoAgent，一个能直接操控浏览器的 AI
 - pause() / play() — 暂停/播放
 - screenshot(name) — 截图
 - click(text, index) — 点击页面上文本为 text 的元素（第 index 个匹配项，默认0）
+- scroll(direction) — 滚动页面，direction: "down"(默认) | "up" | "bottom" | "top"。滚动后可再用 get_page 查看新内容
 - analyze — 在视频页启动完整分析流水线（自动创建会话 → 启动字幕转录 → 启动自动截图分析），一步到位
 - new_session(name, title?, inherit_from?) — 仅创建新会话文件夹，继承旧截图和字幕（不启动分析）。用户说「继承上一讲开新会话」时用这个
 - search(query) — 搜索视频
 - get_page — 需要更详细的页面元素时（链接、按钮等），系统会回传并让你二次决策
 - stop — 停止当前分析/操作（用户说"停止"时输出此动作）
 - mcp(tool, args) — 直接调用底层 MCP 工具，格式: {"type": "mcp", "tool": "工具名", "args": {...}}
+
+**MCP 浏览器工具**（通过 mcp 动作调用）：
+- browser_scroll(direction, amount) — 滚动页面，触发懒加载查看更多内容
+- browser_snapshot(max_elements) — 获取当前页面完整快照（标签/链接/按钮/iframe全文）
+- browser_screenshot(name) — 截图
+- browser_click(text, index) — 点击元素
+- browser_navigate(url) — 导航
 
 **MCP 会话管理工具**（通过 mcp 动作调用，所有会话数据存储在 sessions/sessions.json）：
 - session_list — 列出所有历史会话（查看之前分析过哪些视频、各有多少截图）

@@ -259,6 +259,26 @@ DS 拿到后可以分析页面内容、找到目标链接/按钮。""",
         },
     },
     {
+        "name": "browser_scroll",
+        "description": """滚动页面，触发懒加载查看更多内容。浏览课程列表、搜索结果等长页面时使用。
+
+参数:
+  direction:  "down"（向下滚一屏，默认）| "up" | "bottom"（滚到底）| "top"（回顶部）
+  amount:     滚动像素（0=默认用视口高度的80%）
+
+用法: 滚动后应再次调用 browser_get_page 获取新元素。
+
+返回: {"ok": true, "direction": "down", "px": 600}""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "direction": {"type": "string", "description": "滚动方向", "enum": ["down", "up", "bottom", "top"], "default": "down"},
+                "amount": {"type": "integer", "description": "滚动像素（0=默认）", "default": 0},
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "browser_status",
         "description": """获取当前视频/页面状态。
 
@@ -619,6 +639,18 @@ def _browser_click(args: dict) -> dict:
     try:
         ok = _run_async(_browser.click_element(text=text, index=index))
         return {"clicked": ok, "text": text, "index": index}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _browser_scroll(args: dict) -> dict:
+    if not _ensure_browser():
+        return {"error": "浏览器未连接"}
+    direction = args.get("direction", "down")
+    amount = args.get("amount", 0)
+    try:
+        result = _run_async(_browser.scroll_page(direction=direction, amount=amount))
+        return result
     except Exception as e:
         return {"error": str(e)}
 
@@ -1039,6 +1071,7 @@ def _call_tool(mid, params: dict) -> dict:
         "browser_get_page":   lambda a: _browser_get_page(),
         "browser_snapshot":   lambda a: _browser_scan(a),
         "browser_click":      lambda a: _browser_click(a),
+        "browser_scroll":    lambda a: _browser_scroll(a),
         "browser_status":     lambda a: _browser_status(),
         "browser_connect":    lambda a: _browser_connect(a),
         # 转录

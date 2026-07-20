@@ -449,8 +449,13 @@ class VideoAgent:
         else:
             self._gui.assistant_say("收到！")
 
-        # 记录对话历史
-        self._chat_history.append({"role": "user", "content": text})
+        # 记录对话历史 — 附带页面上下文防止 DS 失忆
+        # 视频页只记原始消息（有 video_state 通过 system prompt 补全）
+        # 非视频页记完整的 user_text（含页面元素），让 DS 记住页面结构
+        if page_context.get("has_video"):
+            self._chat_history.append({"role": "user", "content": text})
+        else:
+            self._chat_history.append({"role": "user", "content": user_text[:2000]})
         self._chat_history.append({"role": "assistant", "content": reply})
         if len(self._chat_history) > 40:
             self._chat_history = self._chat_history[-40:]
@@ -589,14 +594,28 @@ class VideoAgent:
                     click_index = int(act.get("index", 0))
                     if click_text:
                         self._gui.log(f"  click '{click_text[:30]}'", "dim")
-                        state_changed = True
                         result = self._mcp.call("browser_click", {
                             "text": click_text, "index": click_index
                         })
                         if result.get("clicked"):
+                            state_changed = True
                             self._gui.assistant_say(f"已点击「{click_text[:30]}」")
                         else:
                             self._gui.log(f"点击失败: {result.get('error', '未找到元素')}", "warn")
+
+                # ── scroll：页面滚动（触发懒加载查看更多内容）──
+                elif t == "scroll":
+                    direction = act.get("direction", "down")
+                    amount = act.get("amount", 0)
+                    self._gui.log(f"  滚动: {direction}", "dim")
+                    result = self._mcp.call("browser_scroll", {
+                        "direction": direction, "amount": amount
+                    })
+                    if result.get("ok"):
+                        state_changed = True
+                        self._gui.assistant_say(f"已滚动页面（{direction}）")
+                    else:
+                        self._gui.log(f"滚动失败: {result.get('error', '未知')}", "warn")
 
                 # ── navigate：页面导航 ──
                 elif t == "navigate":
