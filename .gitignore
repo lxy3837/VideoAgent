@@ -32,3 +32,6 @@ models/
 
 # Test outputs
 stderr*.log
+
+# Session data (user-generated)
+sessions/

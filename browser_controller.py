@@ -102,7 +102,9 @@ def is_cdp_running(port: int = CDP_DEFAULT_PORT) -> bool:
     # 第一步：原生 TCP socket ping
     tcp_ok = _tcp_ping("127.0.0.1", port) or _tcp_ping("localhost", port)
     if not tcp_ok:
+        print(f"[Browser] CDP 检测: TCP ping 端口 {port} 失败（无监听）")
         return False
+    print(f"[Browser] CDP 检测: TCP ping 端口 {port} 成功")
 
     # 第二步：HTTP 请求确认 CDP 服务可用
     proxy_handler = urllib.request.ProxyHandler({})
@@ -114,11 +116,14 @@ def is_cdp_running(port: int = CDP_DEFAULT_PORT) -> bool:
             data = req.read()
             req.close()
             if b"Browser" in data:
+                print(f"[Browser] CDP 检测: /json/version 响应包含 Browser → 确认 CDP 可用 [OK]")
                 return True
-        except Exception:
-            continue
+            print(f"[Browser] CDP 检测: {host}:{port}/json/version 返回不包含 Browser (data={data[:100]})")
+        except Exception as e:
+            print(f"[Browser] CDP 检测: {host}:{port}/json/version 请求失败: {e}")
 
     # 第三步：回退 /json/list
+    print(f"[Browser] CDP 检测: /json/version 验证失败，尝试 /json/list...")
     for host in ["127.0.0.1", "localhost"]:
         url = f"http://{host}:{port}/json/list"
         try:
@@ -126,10 +131,13 @@ def is_cdp_running(port: int = CDP_DEFAULT_PORT) -> bool:
             data = req.read()
             req.close()
             if data.strip().startswith(b"["):
+                print(f"[Browser] CDP 检测: /json/list 返回 JSON 数组 → 确认 CDP 可用 [OK]")
                 return True
-        except Exception:
-            continue
+            print(f"[Browser] CDP 检测: {host}:{port}/json/list 不是有效 JSON 数组")
+        except Exception as e:
+            print(f"[Browser] CDP 检测: {host}:{port}/json/list 请求失败: {e}")
 
+    print(f"[Browser] CDP 检测: 所有验证方式均失败，CDP 不可用")
     return False
 
 
@@ -145,25 +153,35 @@ def _kill_and_launch_edge_cdp(port: int = CDP_DEFAULT_PORT, timeout: float = 30.
     """
     edge_path = _find_edge()
     if not edge_path:
-        print("[Browser] 找不到 Edge 安装路径")
+        print("[Browser] CDP 兜底: 找不到 Edge 安装路径")
         return False
 
     real_profile = os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\User Data")
     agent_profile = str(Path(os.environ.get("TEMP", ".")) / "video_agent_profile")
 
+    print(f"[Browser] CDP 兜底: Edge 路径 = {edge_path}")
+    print(f"[Browser] CDP 兜底: 真实 Profile = {real_profile}")
+    print(f"[Browser] CDP 兜底: Agent Profile = {agent_profile}")
+
     # 1. 优雅关闭（保存会话）
+    print(f"[Browser] CDP 兜底: 步骤1 - 优雅关闭 Edge（保存会话）...")
     _kill_all_edge(False)
     time.sleep(2)
 
     # 2. 强制清理残留
+    print(f"[Browser] CDP 兜底: 步骤2 - 强制清理残留进程...")
     _kill_all_edge(True)
     time.sleep(0.5)
 
     # 3. 复制 Profile（仅关键登录数据，非全量拷贝）
+    print(f"[Browser] CDP 兜底: 步骤3 - 复制 Profile...")
     _copy_profile_fast(real_profile, agent_profile)
 
     # 4. 启动独立 Edge 实例（独立 user-data-dir → CDP 必定生效）
-    return _start_edge_cdp(edge_path, port, user_data_dir=agent_profile, timeout=timeout)
+    print(f"[Browser] CDP 兜底: 步骤4 - 启动带 CDP 的 Edge (端口 {port}, timeout={timeout}s)...")
+    result = _start_edge_cdp(edge_path, port, user_data_dir=agent_profile, timeout=timeout)
+    print(f"[Browser] CDP 兜底: 步骤4 结果 = {'成功 [OK]' if result else '失败 [FAIL]'}")
+    return result
 
 
 def _copy_profile_fast(src: str, dst: str):
@@ -193,17 +211,26 @@ def _copy_profile_fast(src: str, dst: str):
 
     try:
         os.makedirs(dst, exist_ok=True)
+        copied, skipped, errored = 0, 0, 0
         for item in key_items:
             src_path = os.path.join(src, item)
             dst_path = os.path.join(dst, item)
-            if os.path.isdir(src_path):
-                if os.path.exists(dst_path):
-                    shutil.rmtree(dst_path, ignore_errors=True)
-                shutil.copytree(src_path, dst_path)
-            elif os.path.isfile(src_path):
-                shutil.copy2(src_path, dst_path)
+            try:
+                if os.path.isdir(src_path):
+                    if os.path.exists(dst_path):
+                        shutil.rmtree(dst_path, ignore_errors=True)
+                    shutil.copytree(src_path, dst_path)
+                    copied += 1
+                elif os.path.isfile(src_path):
+                    shutil.copy2(src_path, dst_path)
+                    copied += 1
+                else:
+                    skipped += 1
+            except (PermissionError, OSError) as e:
+                print(f"[Browser] Profile 复制: 跳过 {item}（{e}）")
+                errored += 1
 
-        # 复制 Default 目录下的关键文件（Profile 1 默认在这里）
+        # 复制 Default 目录下的关键文件
         default_src = os.path.join(src, "Default")
         default_dst = os.path.join(dst, "Default")
         if os.path.isdir(default_src):
@@ -211,12 +238,18 @@ def _copy_profile_fast(src: str, dst: str):
             for item in key_items:
                 src_path = os.path.join(default_src, item)
                 dst_path = os.path.join(default_dst, item)
-                if os.path.isdir(src_path):
-                    if os.path.exists(dst_path):
-                        shutil.rmtree(dst_path, ignore_errors=True)
-                    shutil.copytree(src_path, dst_path)
-                elif os.path.isfile(src_path):
-                    shutil.copy2(src_path, dst_path)
+                try:
+                    if os.path.isdir(src_path):
+                        if os.path.exists(dst_path):
+                            shutil.rmtree(dst_path, ignore_errors=True)
+                        shutil.copytree(src_path, dst_path)
+                        copied += 1
+                    elif os.path.isfile(src_path):
+                        shutil.copy2(src_path, dst_path)
+                        copied += 1
+                except (PermissionError, OSError) as e:
+                    print(f"[Browser] Profile 复制: 跳过 Default/{item}（{e}）")
+                    errored += 1
 
         # 写入 First Run 标记（跳过首次引导）
         with open(os.path.join(dst, "First Run"), "w") as f:
@@ -230,6 +263,23 @@ def _copy_profile_fast(src: str, dst: str):
         print(f"[Browser] Profile 已复制 ({sum(1 for _ in Path(dst).rglob('*'))} 文件)")
     except Exception as e:
         print(f"[Browser] Profile 复制异常（可能部分登录态丢失）: {e}")
+
+
+def _ensure_profile(agent_profile: str):
+    """首次运行时从真实 Edge Profile 拷贝登录态到 agent profile。
+    后续运行时跳过（Profile 已有数据，登录态通过 Playwright 持久化保留）。
+    """
+    local_state = os.path.join(agent_profile, "Local State")
+    if os.path.exists(local_state):
+        print(f"[Browser] Profile 已存在，跳过拷贝")
+        return  # 已初始化过
+
+    real_profile = os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\User Data")
+    if os.path.isdir(real_profile):
+        print(f"[Browser] 首次运行：从真实 Profile 拷贝登录数据...")
+        _copy_profile_fast(real_profile, agent_profile)
+    else:
+        print(f"[Browser] 首次运行：无真实 Profile，使用全新独立 Edge")
 
 
 def _is_edge_running() -> bool:
@@ -254,6 +304,7 @@ def _kill_all_edge(force: bool = True):
 
     if not force:
         # 先优雅关闭主进程（不加 /f），让 Edge 有机会保存会话
+        print(f"[Browser] CDP 兜底: 优雅关闭 msedge.exe（/t 不强制）...")
         try:
             subprocess.run(
                 ["taskkill", "/t", "/im", "msedge.exe"],
@@ -261,11 +312,13 @@ def _kill_all_edge(force: bool = True):
                 timeout=5,
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
-        except Exception:
-            pass
+            print(f"[Browser] CDP 兜底: 优雅关闭完成")
+        except Exception as e:
+            print(f"[Browser] CDP 兜底: 优雅关闭异常: {e}")
         time.sleep(3)  # 等 Edge 写完会话数据
 
     # 强制清理残留
+    print(f"[Browser] CDP 兜底: 强制清理 {'(force)' if force else '(后续)'}...")
     for name in names:
         try:
             subprocess.run(
@@ -273,8 +326,8 @@ def _kill_all_edge(force: bool = True):
                 capture_output=True,
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Browser] CDP 兜底: 强制杀 {name} 异常: {e}")
 
     try:
         subprocess.run(
@@ -283,8 +336,9 @@ def _kill_all_edge(force: bool = True):
             capture_output=True,
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
-    except Exception:
-        pass
+        print(f"[Browser] CDP 兜底: PowerShell 清理完成")
+    except Exception as e:
+        print(f"[Browser] CDP 兜底: PowerShell 清理异常: {e}")
 
 
 
@@ -309,8 +363,8 @@ def _start_edge_cdp(edge_path: str, port: int, user_data_dir: str = "", timeout:
     if user_data_dir:
         args.insert(1, f"--user-data-dir={user_data_dir}")
 
-    print(f"[Browser] 正在启动 Edge (端口 {port})...")
-    print(f"[Browser] 命令: {edge_path} --remote-debugging-port={port}")
+    print(f"[Browser] CDP 兜底: 正在启动 Edge (端口 {port})...")
+    print(f"[Browser] CDP 兜底: 完整命令: {edge_path} --remote-debugging-port={port} --user-data-dir={user_data_dir or '(默认)'}")
     try:
         proc = subprocess.Popen(
             args,
@@ -318,9 +372,9 @@ def _start_edge_cdp(edge_path: str, port: int, user_data_dir: str = "", timeout:
             stderr=subprocess.DEVNULL,
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
-        print(f"[Browser] Edge 进程已启动 (PID={proc.pid})")
+        print(f"[Browser] CDP 兜底: Edge 进程已启动 (PID={proc.pid})")
     except Exception as e:
-        print(f"[Browser] Edge 启动失败: {e}")
+        print(f"[Browser] CDP 兜底: Edge 进程启动失败: {e}")
         return False
 
     # 等待 CDP 就绪
@@ -328,15 +382,19 @@ def _start_edge_cdp(edge_path: str, port: int, user_data_dir: str = "", timeout:
     last_log = 0
     while time.time() < deadline:
         if is_cdp_running(port):
-            print(f"[Browser] CDP localhost:{port} 就绪 ✓")
+            elapsed = time.time() - (deadline - timeout)
+            print(f"[Browser] CDP 兜底: CDP localhost:{port} 就绪 [OK] (耗时 {elapsed:.1f}s)")
             return True
         now = time.time()
         if now - last_log >= 2.0:
             # 确认进程还在
             alive = proc.poll() is None if proc else "?"
-            print(f"[Browser] 等待 CDP... (剩余 {deadline - now:.0f}s, Edge:{'存活' if alive else '已退出'})")
+            remaining = deadline - now
+            print(f"[Browser] CDP 兜底: 等待 CDP... (剩余 {remaining:.0f}s, Edge 进程: {'存活' if alive else '已退出!'})")
             last_log = now
         time.sleep(0.5)
+
+    print(f"[Browser] CDP 兜底: CDP 就绪超时 ({timeout}s)，Edge 进程状态: {'存活' if (proc.poll() is None if proc else False) else '已退出'}")
 
     return False
 
@@ -354,7 +412,7 @@ def find_cdp_port(timeout: float = 30.0) -> int:
     while time.time() < deadline:
         for port in range(CDP_SCAN_RANGE[0], CDP_SCAN_RANGE[1] + 1):
             if is_cdp_running(port):
-                print(f"[Browser] 找到 CDP 端口: {port} ✓")
+                print(f"[Browser] 找到 CDP 端口: {port} [OK]")
                 return port
         time.sleep(1)
     return 0
@@ -656,11 +714,13 @@ class BrowserController:
 
     async def connect(self, auto_start: bool = True) -> bool:
         """
-        连接 Edge CDP。
+        连接 Edge 浏览器（桌面版本，保留用户登录态）。
 
-        策略：
-          1. 9222 端口已监听 → 直接 connect_over_cdp（秒连，不动浏览器）
-          2. 未监听 → 提示用户用桌面「Edge (调试模式)」快捷方式启动 Edge
+        策略（按优先级降级）：
+          1. launch_persistent_context — Playwright 直接管理 Edge 进程
+             → 无需 CDP 端口、无需杀进程、启动快、登录态自动持久化
+          2. connect_over_cdp       — 用户已手动开 Edge 调试模式时使用
+          3. kill + restart CDP     — 兜底：杀进程后以 CDP 模式重启
 
         返回是否连接成功。
         """
@@ -672,61 +732,77 @@ class BrowserController:
         print(f"[Browser] [+{time.time()-t0:.1f}s] 启动 Playwright...")
         self._playwright = await async_playwright().start()
 
-        # ── CDP 已就绪 → 直接连 ──
-        print(f"[Browser] [+{time.time()-t0:.1f}s] 检查 CDP (localhost:9222)...")
-        cdp_ok = await asyncio.to_thread(is_cdp_running)
-        if cdp_ok:
-            try:
-                self._browser = await self._playwright.chromium.connect_over_cdp(
-                    f"http://127.0.0.1:{CDP_DEFAULT_PORT}"
-                )
-                self._connected = True
-                self._port = CDP_DEFAULT_PORT
-                print(f"[Browser] [+{time.time()-t0:.1f}s] CDP 连接成功 ✓（不动浏览器，登录态完整）")
-                return True
-            except Exception as e:
-                print(f"[Browser] CDP 连接异常: {e}")
+        # ── 方案 1（推荐）：launch_persistent_context ──
+        # Playwright 直接管理 Edge 进程，无需 CDP 端口、无需杀进程
+        # Profile 持久化在 %TEMP%\video_agent_profile，登录态跨启动保留
+        # 注意：auto_start=False 时跳过（被动检测不应启动浏览器）
+        if auto_start:
+            agent_profile = str(Path(os.environ.get("TEMP", ".")) / "video_agent_profile")
+            _ensure_profile(agent_profile)
 
-        # ── CDP 未就绪 → 原子化杀+启，用真实 Profile ──
-        print(f"[Browser] [+{time.time()-t0:.1f}s] CDP 未就绪，自动重启 Edge...")
-        if not auto_start:
-            await self._playwright.stop()
-            self._playwright = None
-            return False
-
-        # 关键：杀+启全程在一个同步调用里（asyncio.to_thread），
-        # 中间不 yield，不给 Edge 自动复活的机会
-        launched = await asyncio.to_thread(_kill_and_launch_edge_cdp, CDP_DEFAULT_PORT, 30)
-        if launched:
-            try:
-                self._browser = await self._playwright.chromium.connect_over_cdp(
-                    f"http://127.0.0.1:{CDP_DEFAULT_PORT}"
-                )
-                self._connected = True
-                self._port = CDP_DEFAULT_PORT
-                print(f"[Browser] [+{time.time()-t0:.1f}s] Edge CDP 连接成功 ✓（独立实例 + 登录态）")
-                print(f"[Browser] Profile: %TEMP%\\video_agent_profile")
-                return True
-            except Exception as e:
-                print(f"[Browser] CDP 连接异常: {e}")
-        else:
-            print(f"[Browser] Edge 重启超时")
-            # 兜底：Playwright 临时 Profile
-            print(f"[Browser] [+{time.time()-t0:.1f}s] 兜底：Playwright 独立 Edge...")
-            tmp_dir = str(Path(os.environ.get("TEMP", ".")) / "video_agent_edge")
+            print(f"[Browser] [+{time.time()-t0:.1f}s] 方案1: launch_persistent_context (独立 Edge, channel=msedge)...")
             try:
                 context = await self._playwright.chromium.launch_persistent_context(
-                    user_data_dir=tmp_dir,
+                    user_data_dir=agent_profile,
                     channel="msedge",
                     headless=False,
-                    args=["--no-first-run", "--no-default-browser-check"],
+                    args=[
+                        "--no-first-run",
+                        "--no-default-browser-check",
+                        "--disable-background-mode",
+                        "--disable-features=msEdgeAutoRestartOnCrash,msEdgeSidebar",
+                    ],
+                    # 启动窗口大小：用用户桌面分辨率
+                    no_viewport=True,
                 )
                 self._browser = context.browser
                 self._connected = True
-                print(f"[Browser] [+{time.time()-t0:.1f}s] 独立 Edge 启动成功 ✓（需手动登录）")
+                print(f"[Browser] [+{time.time()-t0:.1f}s] 方案1: 独立 Edge 启动成功 [OK]")
+                print(f"[Browser] Profile: %TEMP%\\video_agent_profile（登录态持久化）")
                 return True
-            except Exception as e2:
-                print(f"[Browser] 兜底也失败了: {e2}")
+            except Exception as e:
+                print(f"[Browser] 方案1: launch_persistent_context 失败: {type(e).__name__}: {e}")
+        else:
+            print(f"[Browser] [+{time.time()-t0:.1f}s] 方案1: auto_start=False，跳过 launch_persistent_context")
+
+        # ── 方案 2：CDP connect_over_cdp（用户手动开了调试模式）──
+        print(f"[Browser] [+{time.time()-t0:.1f}s] 方案2: 检测 CDP (localhost:9222)...")
+        cdp_ok = await asyncio.to_thread(is_cdp_running)
+        if cdp_ok:
+            print(f"[Browser] [+{time.time()-t0:.1f}s] 方案2: CDP 已就绪，连接中...")
+            try:
+                self._browser = await self._playwright.chromium.connect_over_cdp(
+                    f"http://127.0.0.1:{CDP_DEFAULT_PORT}"
+                )
+                self._connected = True
+                self._port = CDP_DEFAULT_PORT
+                print(f"[Browser] [+{time.time()-t0:.1f}s] 方案2: CDP 连接成功 [OK]")
+                return True
+            except Exception as e:
+                print(f"[Browser] 方案2: connect_over_cdp 异常: {e}")
+        else:
+            print(f"[Browser] [+{time.time()-t0:.1f}s] 方案2: CDP 不可用，跳过")
+
+        # ── 方案 3（兜底）：杀进程 + restart Edge with CDP ──
+        if auto_start:
+            print(f"[Browser] [+{time.time()-t0:.1f}s] 方案3: 杀进程 + 重启 CDP Edge...")
+            launched = await asyncio.to_thread(_kill_and_launch_edge_cdp, CDP_DEFAULT_PORT, 30)
+            if launched:
+                print(f"[Browser] [+{time.time()-t0:.1f}s] 方案3: CDP Edge 已启动，连接中...")
+                try:
+                    self._browser = await self._playwright.chromium.connect_over_cdp(
+                        f"http://127.0.0.1:{CDP_DEFAULT_PORT}"
+                    )
+                    self._connected = True
+                    self._port = CDP_DEFAULT_PORT
+                    print(f"[Browser] [+{time.time()-t0:.1f}s] 方案3: CDP 连接成功 [OK]")
+                    return True
+                except Exception as e:
+                    print(f"[Browser] 方案3: connect_over_cdp 异常: {e}")
+            else:
+                print(f"[Browser] [+{time.time()-t0:.1f}s] 方案3: Edge CDP 启动失败")
+        else:
+            print(f"[Browser] [+{time.time()-t0:.1f}s] 方案3: auto_start=False，跳过")
 
         await self._playwright.stop()
         self._playwright = None
@@ -1453,6 +1529,242 @@ class BrowserController:
             "elements": result,
             "source": "ax_tree",  # 标记数据来源
         }
+
+    async def scan_page(self, max_elements: int = 200) -> dict:
+        """全面扫描页面所有关键元素，不做语义分类，交给 LLM 决策。
+
+        与 get_page_structure / get_page_ax_tree 的核心区别：
+        - 不预设"导航链接""视频相关"等分类，只返回原始标签+属性
+        - 捕获 <iframe>（很多视频/教育平台用 iframe 加载播放器）
+        - 捕获所有可见链接、按钮、标题、输入框、图片（带 alt）
+        - 捕获 cursor:pointer 的 div/span（Vue/React SPA 组件）
+        - 返回统计摘要（链接数、按钮数、iframe数等），帮助 LLM 快速判断页面类型
+
+        适用于非标视频站、SPA、自定义播放器 — 这些页面用 CSS class 匹配不到元素。
+        """
+        await self.ensure_active_tab()
+        if not self._page:
+            return {"error": "未连接到任何页面", "elements": [], "stats": {}}
+
+        # Playwright 侧获取标题/URL（比 JS 更可靠）
+        title = ""
+        url = ""
+        try:
+            title = await self._page.title() or ""
+            url = self._page.url or ""
+        except Exception:
+            pass
+
+        MAX = max_elements
+        # 在浏览器内执行扫描 —— 捕获所有有意义元素
+        scan = await self._page.evaluate(f"""
+        (() => {{
+            const MAX = {MAX};
+
+            const visible = (el) => {{
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 0 && r.height > 0
+                    && s.display !== 'none'
+                    && s.visibility !== 'hidden'
+                    && s.opacity !== '0';
+            }};
+
+            const text = (el) => {{
+                const t = (el.textContent || el.getAttribute('aria-label') || el.title || '').trim();
+                return t ? t.replace(/\\s+/g, ' ').substring(0, 100) : '';
+            }};
+
+            const elements = [];
+            const seen = new Set();
+
+            const add = (elem) => {{
+                const key = elem.tag + '|' + elem.text + '|' + (elem.href || '') + '|' + (elem.src || '');
+                if (seen.has(key) || elements.length >= MAX) return;
+                seen.add(key);
+                elements.push(elem);
+            }};
+
+            // ═══ Shadow DOM 递归扫描 ═══
+            // 很多 Web Component / 自定义元素的内容在 shadowRoot 里
+            const scanShadow = (root) => {{
+                if (!root || !root.querySelectorAll) return;
+                // 递归每个子节点的 shadowRoot
+                root.querySelectorAll('*').forEach(el => {{
+                    if (elements.length >= MAX) return;
+                    // 扫描该元素自己的 shadow DOM
+                    if (el.shadowRoot) {{
+                        scanShadow(el.shadowRoot);
+                        // 也扫描 shadow root 的直接子元素
+                        el.shadowRoot.querySelectorAll('*').forEach(inner => {{
+                            if (elements.length >= MAX) return;
+                            const tag = inner.tagName ? inner.tagName.toLowerCase() : '';
+                            if (tag === 'a' && inner.href) {{
+                                const t = text(inner);
+                                if (t) add({{tag: 'a', text: t, href: inner.href, shadow: true}});
+                            }} else if (tag === 'button') {{
+                                const t = text(inner);
+                                if (t) add({{tag: 'button', text: t, shadow: true}});
+                            }} else if (tag === 'iframe') {{
+                                const src = inner.src || '';
+                                if (src) add({{tag: 'iframe', text: '', src: src, shadow: true}});
+                            }}
+                        }});
+                    }}
+                }});
+            }};
+            scanShadow(document);
+
+            // ═══ 1. 标题 (h1-h6) ═══
+            document.querySelectorAll('h1, h2, h3, h4, h5, h6').forEach(el => {{
+                if (!visible(el)) return;
+                const t = text(el);
+                if (t) add({{tag: el.tagName.toLowerCase(), text: t}});
+            }});
+
+            // ═══ 2. iframe / object / embed — 关键！很多播放器在这里 ═══
+            document.querySelectorAll('iframe, object, embed').forEach(el => {{
+                const src = el.src || el.data || el.getAttribute('data-src') || '';
+                const t = el.title || el.name || text(el) || '';
+                if (src || t) add({{
+                    tag: el.tagName.toLowerCase(),
+                    text: t,
+                    src: src,
+                    name: el.name || '',
+                    id: el.id || ''
+                }});
+            }});
+
+            // ═══ 3. video / audio ═══
+            document.querySelectorAll('video, audio').forEach(el => {{
+                const src = el.src || (el.querySelector('source') || {{}}).src || '';
+                const t = text(el) || el.getAttribute('aria-label') || '';
+                add({{
+                    tag: el.tagName.toLowerCase(),
+                    text: t,
+                    src: src,
+                    paused: el.paused,
+                    duration: el.duration || 0,
+                    currentTime: el.currentTime || 0
+                }});
+            }});
+
+            // ═══ 4. 所有可见链接 ═══
+            document.querySelectorAll('a[href]').forEach(el => {{
+                if (!visible(el)) return;
+                const t = text(el);
+                const href = el.href || el.getAttribute('href') || '';
+                if (t && href && !href.startsWith('javascript:') && !href.startsWith('mailto:')) {{
+                    add({{tag: 'a', text: t, href: href}});
+                }}
+            }});
+
+            // ═══ 5. 按钮 ═══
+            document.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"]').forEach(el => {{
+                if (!visible(el)) return;
+                const t = text(el);
+                if (t) add({{tag: 'button', text: t}});
+            }});
+
+            // ═══ 6. ARIA 角色 — 标签页 / 菜单项 / 树节点 / 列表项 ═══
+            const ariaRoles = [
+                '[role="tab"]', '[role="menuitem"]', '[role="treeitem"]',
+                '[role="listitem"]', '[role="option"]', '[role="gridcell"]',
+                '[role="link"]', '[role="checkbox"]', '[role="radio"]',
+                '[role="switch"]', '[role="combobox"]'
+            ];
+            ariaRoles.forEach(sel => {{
+                try {{
+                    document.querySelectorAll(sel).forEach(el => {{
+                        if (!visible(el)) return;
+                        const t = text(el);
+                        const role = (el.getAttribute('role') || '').toLowerCase();
+                        if (t) add({{tag: role, text: t}});
+                    }});
+                }} catch(e) {{}}
+            }});
+
+            // ═══ 7. 输入框 / 选择器 ═══
+            document.querySelectorAll('input:not([type="hidden"]), textarea, select').forEach(el => {{
+                if (!visible(el)) return;
+                const t = el.getAttribute('placeholder') || el.getAttribute('aria-label') || el.name || '';
+                if (t) add({{
+                    tag: el.tagName.toLowerCase(),
+                    text: t,
+                    input_type: el.type || '',
+                    name: el.name || ''
+                }});
+            }});
+
+            // ═══ 8. 文本块 — p/span/div 有实质性文本（非交互，但给 DS 提供上下文） ═══
+            const textBlocks = document.querySelectorAll('p, span, div, section, article, aside');
+            for (let i = 0; i < textBlocks.length && elements.length < MAX; i++) {{
+                const el = textBlocks[i];
+                if (!visible(el)) continue;
+                // 跳过已有语义标签的父元素（它们内部的文本已被链接/按钮捕获）
+                const parentTag = el.closest('a,button,nav,header,footer') ? true : false;
+                if (parentTag) continue;
+                const t = text(el);
+                // 只保留一段话以上的文本（>15字符），太短的可能是图标文字
+                if (t && t.length > 15 && t.split(/[，。！？,.!?;；]/).length > 2) {{
+                    const tag = el.tagName.toLowerCase();
+                    // span/div 文本块标记为 text，p/article/section 直接标其标签
+                    const blockTag = (tag === 'span' || tag === 'div') ? 'text' : tag;
+                    add({{tag: blockTag, text: t.substring(0, 120)}});
+                }}
+            }}
+
+            // ═══ 9. 列表结构 — li/dt/dd（课程目录、章节列表等） ═══
+            document.querySelectorAll('li, dt, dd').forEach(el => {{
+                if (!visible(el)) return;
+                const t = text(el);
+                if (t && t.length > 2) add({{tag: 'list_item', text: t.substring(0, 80)}});
+            }});
+
+            // ═══ 10. 图片（带 alt 描述） ═══
+            document.querySelectorAll('img[alt]').forEach(el => {{
+                if (!visible(el)) return;
+                const alt = el.alt.trim();
+                if (alt && alt.length > 2) add({{
+                    tag: 'img',
+                    text: alt,
+                    src: (el.src || '').substring(0, 100)
+                }});
+            }});
+
+            // ═══ 11. cursor:pointer 的 div/span/li（SPA 组件，最低优先级） ═══
+            const clickables = document.querySelectorAll('div, span, td, dt, dd');
+            for (let i = 0; i < clickables.length && elements.length < MAX; i++) {{
+                const el = clickables[i];
+                if (!visible(el)) continue;
+                if (getComputedStyle(el).cursor !== 'pointer') continue;
+                const t = text(el);
+                if (!t || t.length < 2) continue;
+                add({{tag: 'clickable', text: t}});
+            }}
+
+            // 统计摘要 — 帮助 LLM 快速判断页面类型
+            const stats = {{
+                total_links: document.querySelectorAll('a[href]').length,
+                total_buttons: document.querySelectorAll('button, [role="button"]').length,
+                total_iframes: document.querySelectorAll('iframe').length,
+                total_objects: document.querySelectorAll('object, embed').length,
+                total_videos: document.querySelectorAll('video').length,
+                total_images: document.querySelectorAll('img').length,
+                total_headings: document.querySelectorAll('h1,h2,h3,h4,h5,h6').length,
+                total_inputs: document.querySelectorAll('input, textarea, select').length,
+                total_list_items: document.querySelectorAll('li, dt, dd').length,
+                captured: elements.length,
+            }};
+
+            return {{ title: document.title, url: location.href, elements, stats }};
+        }})()
+        """)
+
+        scan["title"] = scan.get("title") or title
+        scan["url"] = scan.get("url") or url
+        scan["source"] = "scan_page"
+        return scan
 
     # ── 页面交互（点击）──
 

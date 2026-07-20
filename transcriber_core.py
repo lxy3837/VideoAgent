@@ -17,6 +17,16 @@ import numpy as np
 import soundcard.mediafoundation as _sc_mf
 warnings.filterwarnings("ignore", category=_sc_mf.SoundcardRuntimeWarning)
 
+# ── 修复 soundcard COM 析构报错 (AttributeError: 'NoneType' object has no attribute 'CoUninitialize') ──
+# 原因: Python 解释器退出时 COM 库先于 _COMLibrary 被清理，__del__ 中 self._com 已是 None
+_original_del = _sc_mf._COMLibrary.__del__
+def _safe_com_del(self):
+    try:
+        _original_del(self)
+    except AttributeError:
+        pass  # COM 已清理，静默忽略
+_sc_mf._COMLibrary.__del__ = _safe_com_del
+
 # ── 模型下载目录 ──
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 os.environ["HF_HOME"] = os.path.join(_SCRIPT_DIR, "models")
